@@ -69,7 +69,8 @@ function generateGeminiLiveSpeech(
   text: string,
   voice: string,
   language: string,
-  personality: string
+  personality: string,
+  model: string
 ) {
   return new Promise<Uint8Array>((resolve, reject) => {
     const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent?key=${encodeURIComponent(apiKey)}`;
@@ -111,7 +112,7 @@ function generateGeminiLiveSpeech(
     socket.onopen = () => {
       socket.send(JSON.stringify({
         setup: {
-          model: 'models/gemini-3.8-live',
+          model,
           generationConfig: {
             responseModalities: ['AUDIO'],
             speechConfig: {
@@ -214,29 +215,34 @@ Deno.serve(async (request) => {
   try {
     const body = await readJsonBody(request, 16 * 1024);
     const { roomCode, playerToken, state } = await authorizeFreezonePlayer(body);
+    const isTest = body.action === 'test';
     const dialogueId = limitedText(body.dialogueId, 128);
-    const pieceId = limitedText(body.pieceId, 256);
-    const text = limitedText(body.text, 120);
+    const pieceId = isTest ? 'connection-test' : limitedText(body.pieceId, 256);
+    const text = isTest
+      ? limitedText(body.text, 120) || 'The Freezone voice connection is working.'
+      : limitedText(body.text, 120);
     if (!pieceId || !text) {
       throw new FreezoneFunctionError('A piece and non-empty speech line are required.');
     }
-    const piece = Array.isArray(state.pieces)
+    const piece = !isTest && Array.isArray(state.pieces)
       ? state.pieces.find((candidate) => candidate?.id === pieceId)
       : null;
-    if (!piece) throw new FreezoneFunctionError('Character profile was not found.', 404);
-    const event = limitedText(body.event, 24);
-    const validDialogue = Boolean(
-      state.aiDialogue &&
-      state.aiDialogue.id === dialogueId &&
-      Array.isArray(state.aiDialogue.lines) &&
-      state.aiDialogue.lines.some((line) => line?.pieceId === pieceId && line?.text === text)
-    );
-    const profileLine = piece.voiceLines?.[event] ?? piece.freeVoiceLines?.[event];
-    const validEventLine = Boolean(
-      voiceEvents.has(event) && typeof profileLine === 'string' && profileLine === text
-    );
-    if (!validDialogue && !validEventLine) {
-      throw new FreezoneFunctionError('This line is not present in the synchronized room state.', 409);
+    if (!isTest) {
+      if (!piece) throw new FreezoneFunctionError('Character profile was not found.', 404);
+      const event = limitedText(body.event, 24);
+      const validDialogue = Boolean(
+        state.aiDialogue &&
+        state.aiDialogue.id === dialogueId &&
+        Array.isArray(state.aiDialogue.lines) &&
+        state.aiDialogue.lines.some((line) => line?.pieceId === pieceId && line?.text === text)
+      );
+      const profileLine = piece.voiceLines?.[event] ?? piece.freeVoiceLines?.[event];
+      const validEventLine = Boolean(
+        voiceEvents.has(event) && typeof profileLine === 'string' && profileLine === text
+      );
+      if (!validDialogue && !validEventLine) {
+        throw new FreezoneFunctionError('This line is not present in the synchronized room state.', 409);
+      }
     }
 
     const provider = typeof body.provider === 'string' ? body.provider : 'gemini-live';
@@ -250,20 +256,30 @@ Deno.serve(async (request) => {
     if (!apiKey) {
       throw new FreezoneFunctionError(`Add a ${provider} API key in Freezone settings or configure it on the server.`, 503);
     }
-    const rateKey = `${roomCode}:${playerToken}:${pieceId}`;
+    const model = limitedText(body.model, 128).replace(/[^a-zA-Z0-9._:/-]/g, '');
+    const rateKey = `${roomCode}:${playerToken}:${isTest ? 'connection-test' : pieceId}`;
     const now = Date.now();
     if (now - (requestTimes.get(rateKey) || 0) < 1500) {
       throw new FreezoneFunctionError('Please wait before requesting another character voice.', 429);
     }
     requestTimes.set(rateKey, now);
 
-    const language = limitedText(piece.language, 16) || 'en-US';
-    const personality = limitedText(piece.personality, 160);
-    const voice = limitedText(piece.aiVoice, 32);
+    const language = isTest
+      ? limitedText(body.language, 16) || 'pt-BR'
+      : limitedText(piece?.language, 16) || 'en-US';
+    const personality = isTest ? '' : limitedText(piece?.personality, 160);
+    const voice = isTest ? 'alloy' : limitedText(piece?.aiVoice, 32);
     const geminiVoice = geminiVoiceByCharacter[voice] || 'Kore';
     if (provider === 'gemini-live') {
       return audioResponse(
-        await generateGeminiLiveSpeech(apiKey, text, geminiVoice, language, personality),
+        await generateGeminiLiveSpeech(
+          apiKey,
+          text,
+          geminiVoice,
+          language,
+          personality,
+          model || 'models/gemini-3.8-live'
+        ),
         'audio/wav'
       );
     }
@@ -276,7 +292,7 @@ Deno.serve(async (request) => {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({
-          model: 'gemini-3.8-flash-tts',
+          model: model || 'gemini-3.8-flash-tts',
           input: [{
             type: 'user_input',
             content: [{
@@ -349,7 +365,7 @@ Deno.serve(async (request) => {
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'gpt-4o-mini-tts',
+        model: model || 'gpt-4o-mini-tts',
         voice,
         input: text,
         instructions,

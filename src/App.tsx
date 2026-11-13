@@ -14,6 +14,7 @@ type CreatorRoom = {
   capacity: number;
 };
 type FreezoneUpgrade = 'red' | 'blue' | 'yellow' | 'purple' | 'white';
+type FreezonePurchaseOrb = 'red' | 'blue' | 'yellow' | 'purple' | 'white' | 'movement';
 type FreezoneAllyRole = 'strategic' | 'offensive' | 'defensive' | 'guardian' | 'collector';
 type MultiplayerAction = () => Promise<MultiplayerResult> | undefined;
 type MultiplayerApi = {
@@ -31,7 +32,13 @@ type MultiplayerApi = {
     pattern: Omit<FreezonePattern, 'id'> | FreezonePattern,
     replacementId?: string
   ) => Promise<{ ok: boolean; error?: string }>;
-  buyFreezoneAlly?: (role: FreezoneAllyRole) => Promise<{ ok: boolean; error?: string }>;
+  buyFreezoneAlly?: (role: FreezoneAllyRole, name?: string) => Promise<{ ok: boolean; error?: string }>;
+  buyFreezoneOrb?: (type: FreezonePurchaseOrb) => Promise<{ ok: boolean; error?: string }>;
+  updateFreezonePieceProfile?: (
+    pieceId: string,
+    profile: Pick<FreezonePattern, 'name' | 'title' | 'catchphrase' | 'appearance' |
+      'description' | 'personality' | 'language' | 'aiVoice' | 'voiceLines'>
+  ) => Promise<{ ok: boolean; error?: string }>;
   upgradeFreezoneSkill?: (type: FreezoneUpgrade) => Promise<{ ok: boolean; error?: string }>;
   upgradeFreezoneEnvelope?: (rows: number, cols: number) => Promise<{ ok: boolean; error?: string }>;
   unlockFreezoneMovement?: (

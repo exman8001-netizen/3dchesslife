@@ -1,7 +1,9 @@
 import {
   expireFreezoneSessions,
+  getFreezoneSeatOccupancy,
   mergeFreezoneRoomState,
-  normalizeFreezoneRoomPublication
+  normalizeFreezoneRoomPublication,
+  reclaimStaleFreezoneSeatClaims
 } from './freezoneCustomization.js';
 import { getFreezoneAIRequestSettings } from './freezoneAISettings.js';
 
@@ -71,8 +73,13 @@ export function requestFreezoneAIMove(payload) {
   const settings = getFreezoneAIRequestSettings();
   return invokeFreezoneFunction('freezone-ai', {
     ...payload,
-    provider: settings.textProvider,
-    apiKey: settings.textApiKey
+    provider: settings.movementProvider,
+    model: settings.movementModel,
+    apiKey: settings.movementApiKey,
+    dialogueEnabled: settings.dialogueEnabled,
+    dialogueProvider: settings.dialogueProvider,
+    dialogueModel: settings.dialogueModel,
+    dialogueApiKey: settings.dialogueApiKey
   });
 }
 
@@ -81,7 +88,23 @@ export function requestFreezoneSpeech(payload) {
   return invokeFreezoneFunction('freezone-speech', {
     ...payload,
     provider: settings.voiceProvider,
+    model: settings.voiceModel,
     apiKey: settings.voiceApiKey
+  }, true);
+}
+
+export function testFreezoneAIService(payload) {
+  return invokeFreezoneFunction('freezone-ai', {
+    ...payload,
+    action: 'test'
+  });
+}
+
+export function testFreezoneSpeechService(payload) {
+  return invokeFreezoneFunction('freezone-speech', {
+    ...payload,
+    action: 'test',
+    text: 'A voz do Freezone está funcionando.'
   }, true);
 }
 
@@ -180,7 +203,15 @@ export async function listPublicRooms(limit = 40) {
       : null;
     const seats = Array.isArray(state.seats) ? state.seats : null;
     const kind = config?.gameMode === 'freezone' ? 'freezone' : config ? 'custom' : 'chess';
-    const joined = seats
+    const occupancy = kind === 'freezone' && seats
+      ? getFreezoneSeatOccupancy({
+        seats,
+        freezoneDepartures: state.freezoneDepartures
+      })
+      : null;
+    const joined = occupancy
+      ? occupancy.occupied
+      : seats
       ? seats.filter((seat) => Boolean(seat?.token)).length
       : Number(hasPlayer(room.white_player)) + Number(hasPlayer(room.black_player));
     const capacity = seats?.length || (config?.playerCount || 2);
@@ -210,7 +241,11 @@ export async function listPublicRooms(limit = 40) {
       format: config?.gameMode === 'freezone' ? arenaFormat : null,
       isMainArena: state.mainArena === true,
       joined,
-      capacity
+      capacity,
+      online: occupancy?.online ?? joined,
+      reconnecting: occupancy?.reconnecting ?? 0,
+      bots: occupancy?.bots ?? 0,
+      staleClaims: occupancy?.staleClaims ?? 0
     };
   });
 }
@@ -364,7 +399,39 @@ export async function joinRoom(code, playerToken) {
         };
       }
       const playerIndex = customSeats.findIndex((seat) => !seat?.token);
-      if (playerIndex < 0) return { ok: false, error: 'Esta sala já está cheia.' };
+      if (playerIndex < 0) {
+        if (freezone) {
+          let onlineTokens;
+          try {
+            onlineTokens = await getFreezonePresenceSnapshot(room.id, playerToken);
+          } catch (error) {
+            return {
+              ok: false,
+              error: `Não foi possível verificar os jogadores online: ${error.message}`
+            };
+          }
+          const reclaimedState = reclaimStaleFreezoneSeatClaims(
+            room.free_mode_state,
+            onlineTokens,
+            Date.now()
+          );
+          if (JSON.stringify(reclaimedState) !== JSON.stringify(room.free_mode_state)) {
+            let update = client.from('rooms')
+              .update({
+                free_mode_state: reclaimedState,
+                updated_at: new Date().toISOString()
+              })
+              .eq('id', room.id);
+            if (room.updated_at) update = update.eq('updated_at', room.updated_at);
+            const { error } = await update.select('id').maybeSingle();
+            throwIfError(error);
+            room = await fetchRoom(code);
+            if (!room) break;
+            continue;
+          }
+        }
+        return { ok: false, error: 'Esta sala já está cheia.' };
+      }
       const nextSeats = customSeats.slice();
       nextSeats[playerIndex] = freezone
         ? {
@@ -582,6 +649,44 @@ export function subscribeToRoom(roomId, onChange) {
   return () => {
     void client.removeChannel(channel);
   };
+}
+
+export function getFreezonePresenceSnapshot(roomId, token) {
+  const client = requireClient();
+  const channel = client.channel(`wizard-chess-freezone-presence-${roomId}`, {
+    config: { presence: { key: `join-check-${token}` } }
+  });
+
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      finish(new Error('Freezone presence check timed out.'));
+    }, 4000);
+    const finish = (error, members = []) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      void client.removeChannel(channel).then(
+        () => error ? reject(error) : resolve(members),
+        (cleanupError) => reject(error || cleanupError)
+      );
+    };
+
+    channel.on('presence', { event: 'sync' }, () => {
+      const members = [];
+      for (const [key, presences] of Object.entries(channel.presenceState())) {
+        for (const presence of presences) {
+          members.push(typeof presence.token === 'string' ? presence.token : key);
+        }
+      }
+      finish(null, members);
+    });
+    channel.subscribe((status, error) => {
+      if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+        finish(error || new Error(`Freezone presence channel status: ${status}`));
+      }
+    });
+  });
 }
 
 export function subscribeToFreezonePresence(roomId, member, onChange, onError = () => {}) {

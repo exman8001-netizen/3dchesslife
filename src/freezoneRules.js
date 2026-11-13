@@ -2,6 +2,7 @@ export const FREEZONE_BOARD_SIZE = 64;
 export const FREEZONE_MUTANT_DURATION_MS = 3 * 60 * 1000;
 export const FREEZONE_ORB_TARGET_COUNT = 512;
 export const FREEZONE_ALLY_COST = 10;
+export const FREEZONE_ALLY_XP_COST = 600;
 export const FREEZONE_ORB_TYPES = ['xp', 'red', 'blue', 'yellow', 'purple', 'white', 'bot', 'movement'];
 export const FREEZONE_MOVEMENT_ORB_COST = 1;
 export const FREEZONE_ENVELOPE_ORB_COST = 2;
@@ -12,14 +13,34 @@ export const FREEZONE_TILE_GEOMETRIES = ['square', 'triangle', 'hexagonal', 'rou
 export const FREEZONE_MAX_MOVEMENT_RANGE = 8;
 export const FREEZONE_MAX_PIECE_COOLDOWN_MS = 60000;
 export const FREEZONE_DEFAULT_ORB_XP = {
-  xp: 1,
-  red: 0,
-  blue: 0,
-  yellow: 0,
-  purple: 0,
-  white: 0,
-  bot: 0,
-  movement: 0
+  xp: 10,
+  red: 10,
+  blue: 10,
+  yellow: 10,
+  purple: 10,
+  white: 10,
+  bot: 10,
+  movement: 10
+};
+export const FREEZONE_DEFAULT_ECONOMY = {
+  pieceCostXP: 100,
+  allyCostXP: FREEZONE_ALLY_XP_COST,
+  orbCosts: {
+    red: 200,
+    blue: 200,
+    yellow: 300,
+    white: 400,
+    purple: 500,
+    movement: 250
+  },
+  eliminationXP: {
+    pawn: 300,
+    knight: 350,
+    bishop: 350,
+    rook: 400,
+    queen: 450,
+    king: 500
+  }
 };
 export const FREEZONE_ALLY_ROLES = [
   'strategic',
@@ -99,6 +120,98 @@ export function normalizeFreezoneOrbSettings(value) {
     return [type, Math.max(0, Math.min(1000, amount))];
   }));
   return { enabledTypes, xpByType };
+}
+
+export function normalizeFreezoneEconomySettings(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const normalizeCost = (raw, fallback) => Number.isSafeInteger(raw)
+    ? Math.max(0, Math.min(1_000_000_000, raw))
+    : fallback;
+  const normalizeTable = (raw, defaults) => Object.fromEntries(
+    Object.entries(defaults).map(([key, fallback]) => [
+      key,
+      normalizeCost(raw?.[key], fallback)
+    ])
+  );
+  return {
+    pieceCostXP: normalizeCost(source.pieceCostXP, FREEZONE_DEFAULT_ECONOMY.pieceCostXP),
+    allyCostXP: normalizeCost(source.allyCostXP, FREEZONE_DEFAULT_ECONOMY.allyCostXP),
+    orbCosts: normalizeTable(source.orbCosts, FREEZONE_DEFAULT_ECONOMY.orbCosts),
+    eliminationXP: normalizeTable(source.eliminationXP, FREEZONE_DEFAULT_ECONOMY.eliminationXP)
+  };
+}
+
+export function normalizeFreezoneWallet(player = {}) {
+  const source = player && typeof player === 'object' ? player : {};
+  const storedOrbs = source.orbBalances && typeof source.orbBalances === 'object'
+    ? source.orbBalances
+    : {};
+  const numericBalance = (value) => Number.isFinite(Number(value))
+    ? Math.max(0, Math.min(2_000_000_000, Math.floor(Number(value))))
+    : 0;
+  const xp = Math.max(numericBalance(source.xp), numericBalance(storedOrbs.xp));
+  return {
+    xp,
+    orbBalances: Object.fromEntries(
+      FREEZONE_ORB_TYPES.filter((type) => type !== 'xp').map((type) => [
+        type,
+        numericBalance(storedOrbs[type])
+      ])
+    )
+  };
+}
+
+export function applyFreezoneOrbCollection(player = {}, type, xpAmount) {
+  if (!FREEZONE_ORB_TYPES.includes(type) ||
+      !Number.isSafeInteger(xpAmount) || xpAmount < 0) {
+    return { ok: false, error: 'Choose a valid orb and XP reward.' };
+  }
+  const wallet = normalizeFreezoneWallet(player);
+  return {
+    ok: true,
+    player: {
+      ...player,
+      xp: Math.min(2_000_000_000, wallet.xp + xpAmount),
+      orbBalances: type === 'xp'
+        ? wallet.orbBalances
+        : {
+          ...wallet.orbBalances,
+          [type]: Math.min(2_000_000_000, wallet.orbBalances[type] + 1)
+        }
+    }
+  };
+}
+
+export function applyFreezoneOrbPurchase(player = {}, type, economy = {}) {
+  const settings = normalizeFreezoneEconomySettings(economy);
+  if (!Object.prototype.hasOwnProperty.call(settings.orbCosts, type)) {
+    return { ok: false, error: 'Choose a valid upgrade orb.' };
+  }
+  const wallet = normalizeFreezoneWallet(player);
+  const cost = settings.orbCosts[type];
+  if (wallet.xp < cost) {
+    return { ok: false, error: `You need ${cost - wallet.xp} more XP to buy this orb.` };
+  }
+  if (wallet.orbBalances[type] >= 2_000_000_000) {
+    return { ok: false, error: 'Your orb inventory is full.' };
+  }
+  return {
+    ok: true,
+    cost,
+    player: {
+      ...player,
+      xp: wallet.xp - cost,
+      orbBalances: {
+        ...wallet.orbBalances,
+        [type]: wallet.orbBalances[type] + 1
+      }
+    }
+  };
+}
+
+export function getFreezoneEliminationXP(pieceType, economy = FREEZONE_DEFAULT_ECONOMY) {
+  const normalized = normalizeFreezoneEconomySettings(economy);
+  return normalized.eliminationXP[pieceType] || 0;
 }
 
 /**
@@ -334,6 +447,19 @@ function movementEntries(piece) {
     if (jumps.has(key)) return { row, col, kind: 'jump' };
     return { row, col, kind: 'drag' };
   });
+}
+
+export function resetExpiredFreezoneMoveCycle(player, now = Date.now()) {
+  if (!player || typeof player !== 'object' || !Number.isFinite(now) ||
+      !Number.isFinite(player.cooldownUntil) || player.cooldownUntil <= 0 ||
+      player.cooldownUntil > now) return player;
+  return {
+    ...player,
+    movesUsed: 0,
+    stepsUsed: 0,
+    cooldownUntil: 0,
+    movedPieceIds: []
+  };
 }
 
 /**

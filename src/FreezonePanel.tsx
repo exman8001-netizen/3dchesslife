@@ -5,11 +5,17 @@ import {
   FREEZONE_AI_VOICES,
   FREEZONE_APPEARANCES,
   FREEZONE_VOICE_EVENTS,
+  formatFreezoneSessionAge,
   resolveFreezoneVoice,
-  shouldSpeakFreezoneVoice
+  shouldSpeakFreezoneVoice,
+  shouldUseCompactFreezoneLeaderboard
 } from './freezoneCustomization.js';
 import { shouldRequestFreezoneAIVoice } from './freezoneAi.js';
-import { requestFreezoneSpeech } from './multiplayerSupabase.js';
+import {
+  requestFreezoneSpeech,
+  testFreezoneAIService,
+  testFreezoneSpeechService
+} from './multiplayerSupabase.js';
 import {
   clearFreezoneAIKeys,
   getFreezoneAISettings,
@@ -25,13 +31,21 @@ import {
   validateFreezoneAudioUrl
 } from './freezoneRules.js';
 
+function getFreezoneAudioPlaybackError(error?: unknown) {
+  if (error instanceof Error && error.name === 'NotAllowedError') {
+    return 'The browser blocked audio playback. Press “Enable audio here” to try again.';
+  }
+  return 'This URL could not be streamed as audio. The server may offer it as a download or use an unsupported audio type. Download the MP3 and load it as a local file; local playback is only on this device.';
+}
+
 type PieceType = 'pawn' | 'rook' | 'knight' | 'bishop' | 'queen';
 type MoveOffset = [number, number];
 type VoiceEventKey =
   | 'entry' | 'move' | 'capture' | 'death' | 'allyDeath' | 'purchase' | 'upgrade'
   | 'inactivity' | 'inspection' | 'victory' | 'defeat' | 'vulnerable';
 type PieceVoiceLines = Record<VoiceEventKey, string>;
-type AIProviderKey = 'gemini' | 'openai' | 'deepseek' | 'google';
+type FreezoneTextProvider = 'openrouter' | 'gemini' | 'openai' | 'deepseek';
+type FreezoneSpeechProvider = 'gemini-live' | 'gemini-tts' | 'openai-tts' | 'google-tts';
 
 type FreezoneRoom = {
   id: string;
@@ -48,6 +62,10 @@ type FreezoneRoom = {
   isMainArena: boolean;
   joined: number;
   capacity: number;
+  online?: number;
+  reconnecting?: number;
+  bots?: number;
+  staleClaims?: number;
 };
 
 export type FreezonePattern = {
@@ -110,7 +128,62 @@ type FreezoneOnlinePlayer = {
   bot: boolean;
   online: true;
   playing: boolean;
+  kills?: number;
+  xp?: number;
+  orbsCollected?: number;
+  pieces?: number;
+  sessionStartedAt?: number;
+  timeLabel?: string;
 };
+
+type FreezoneRoomRankingEntry = FreezoneOnlinePlayer & {
+  position: number;
+  leader: boolean;
+  crown: boolean;
+};
+type FreezoneShopTab = 'shop' | 'bots' | 'resources' | 'profile' | 'api';
+type FreezonePurchaseOrb = Exclude<FreezoneOrbEffect['type'], 'xp' | 'bot'>;
+type FreezoneAIService = 'movement' | 'dialogue' | 'speech';
+type FreezoneAIServiceStatus = {
+  state: 'idle' | 'checking' | 'ok' | 'error';
+  message: string;
+};
+
+function waitForFreezoneAITestResult(requestId: string, timeoutMs: number) {
+  return new Promise<{ message: string }>((resolve, reject) => {
+    let timeout = 0;
+    const handleResult = (event: Event) => {
+      const detail = (event as CustomEvent<{
+        requestId?: string;
+        ok?: boolean;
+        message?: string;
+      }>).detail;
+      if (detail?.requestId !== requestId) return;
+      window.removeEventListener('wizard-chess-freezone-ai-test-result', handleResult);
+      window.clearTimeout(timeout);
+      if (detail.ok) resolve({ message: detail.message || 'Test completed.' });
+      else reject(new Error(detail.message || 'The Freezone test action failed.'));
+    };
+    timeout = window.setTimeout(() => {
+      window.removeEventListener('wizard-chess-freezone-ai-test-result', handleResult);
+      reject(new Error('The Freezone test action timed out.'));
+    }, timeoutMs);
+    window.addEventListener('wizard-chess-freezone-ai-test-result', handleResult);
+  });
+}
+
+const FREEZONE_TEXT_MODEL_DEFAULTS = {
+  openrouter: 'deepseek/deepseek-v4.1-flash',
+  gemini: 'gemini-2.5-flash',
+  openai: 'gpt-4o-mini',
+  deepseek: 'deepseek-flash'
+} as const;
+const FREEZONE_SPEECH_MODEL_DEFAULTS = {
+  'gemini-live': 'models/gemini-3.8-live',
+  'gemini-tts': 'gemini-3.8-flash-tts',
+  'openai-tts': 'gpt-4o-mini-tts',
+  'google-tts': ''
+} as const;
 
 type FreezoneHud = {
   enabled: boolean;
@@ -139,12 +212,14 @@ type FreezoneHud = {
   orbBalances: Record<FreezoneOrbEffect['type'], number>;
   allies: FreezoneAlly[];
   alliedBots: Array<FreezoneAlly & { side: number; playing: boolean }>;
+  aiBotsEnabled?: boolean;
   allyCost: number;
   canUpgrade: Record<FreezoneUpgrade, boolean>;
   ownedPieces: FreezoneOwnedPiece[];
   orbEffects: FreezoneOrbEffect[];
   movesUsed: number;
   cooldownMs: number;
+  cooldownUntil: number;
   boardSize: number;
   maxPlayers: number;
   roomCode?: string;
@@ -158,6 +233,22 @@ type FreezoneHud = {
     eliminations: number;
   }>;
   onlinePlayers: FreezoneOnlinePlayer[];
+  teamPieces: Array<{
+    id: string;
+    name: string;
+    type: FreezoneOwnedPiece['type'];
+    ally: boolean;
+    cooldownDurationMs: number;
+    readyAt: number;
+    cooldownMs: number;
+  }>;
+  economy: {
+    pieceCostXP: number;
+    allyCostXP: number;
+    orbCosts: Record<string, number>;
+    eliminationXP: Record<string, number>;
+  };
+  roomLeaderboard?: FreezoneRoomRankingEntry[];
   botsEnabled: boolean;
 };
 
@@ -234,7 +325,16 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [rooms, setRooms] = useState<FreezoneRoom[]>([]);
   const [roomsLoading, setRoomsLoading] = useState(false);
   const [notice, setNotice] = useState('');
+  const [feedback, setFeedback] = useState('');
   const [radioOpen, setRadioOpen] = useState(false);
+  const [rankingCollapsed, setRankingCollapsed] = useState(false);
+  const [activeShopTab, setActiveShopTab] = useState<FreezoneShopTab>('shop');
+  const [allyNameDraft, setAllyNameDraft] = useState('');
+  const [editingPieceId, setEditingPieceId] = useState('');
+  const [cooldownNow, setCooldownNow] = useState(Date.now);
+  const [compactLeaderboard, setCompactLeaderboard] = useState(
+    () => (typeof window === 'undefined' ? false : shouldUseCompactFreezoneLeaderboard(window.innerWidth))
+  );
   const [botsBusy, setBotsBusy] = useState(false);
   const [allyRole, setAllyRole] = useState<FreezoneAllyRole>('strategic');
   const [designMode, setDesignMode] = useState(false);
@@ -263,7 +363,21 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [aiAssistEnabled, setAIAssistEnabled] = useState(
     () => readLocalSetting('freezone-ai-assist-enabled') === 'true'
   );
-  const [aiSettings, setAISettings] = useState(() => getFreezoneAISettings());
+  const [aiBotsEnabled, setAIBotsEnabled] = useState(
+    () => readLocalSetting('freezone-ai-bots-enabled') === 'true'
+  );
+  const [aiSettings, setAISettings] = useState(() => {
+    try {
+      const saved = JSON.parse(readLocalSetting('freezone-ai-preferences', '{}'));
+      updateFreezoneAISettings(saved);
+    } catch {
+      updateFreezoneAISettings({});
+    }
+    return getFreezoneAISettings();
+  });
+  const [aiServiceStatuses, setAIServiceStatuses] = useState<
+    Partial<Record<FreezoneAIService, FreezoneAIServiceStatus>>
+  >({});
   const [aiVoiceStatus, setAIVoiceStatus] = useState('');
   const [aiVoiceReady, setAIVoiceReady] = useState(false);
   const [selectedVoiceURI, setSelectedVoiceURI] = useState(
@@ -286,6 +400,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [movementKind, setMovementKind] = useState<'drag' | 'jump' | 'teleport'>('drag');
   const [slide, setSlide] = useState(false);
   const noticeTimer = useRef<number | null>(null);
+  const feedbackTimer = useRef<number | null>(null);
   const musicRef = useRef<HTMLAudioElement | null>(null);
   const localMusicUrl = useRef('');
   const aiVoiceAudioRef = useRef<HTMLAudioElement | null>(null);
@@ -303,25 +418,212 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }));
   }, [aiAssistEnabled]);
 
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('freezone-ai-bots-enabled', String(aiBotsEnabled));
+    } catch {}
+  }, [aiBotsEnabled]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem('freezone-ai-preferences', JSON.stringify({
+        movementProvider: aiSettings.movementProvider,
+        movementModel: aiSettings.movementModel,
+        dialogueProvider: aiSettings.dialogueProvider,
+        dialogueModel: aiSettings.dialogueModel,
+        dialogueEnabled: aiSettings.dialogueEnabled,
+        voiceProvider: aiSettings.voiceProvider,
+        voiceModel: aiSettings.voiceModel
+      }));
+    } catch {}
+  }, [aiSettings]);
+
   const updateAISettings = (change: Partial<ReturnType<typeof getFreezoneAISettings>>) => {
     const next = {
       ...aiSettings,
       ...change,
-      apiKeys: { ...aiSettings.apiKeys, ...(change.apiKeys || {}) }
+      apiKeys: { ...aiSettings.apiKeys, ...(change.apiKeys || {}) },
+      serviceApiKeys: { ...aiSettings.serviceApiKeys, ...(change.serviceApiKeys || {}) }
     };
     setAISettings(next);
     updateFreezoneAISettings(next);
-  };
-
-  const updateAIKey = (provider: AIProviderKey, value: string) => {
-    updateAISettings({ apiKeys: { ...aiSettings.apiKeys, [provider]: value } });
+    const changed: FreezoneAIService[] = [];
+    if ('movementProvider' in change || 'movementModel' in change ||
+        change.serviceApiKeys?.movement !== undefined) changed.push('movement');
+    if ('dialogueProvider' in change || 'dialogueModel' in change ||
+        change.serviceApiKeys?.dialogue !== undefined) changed.push('dialogue');
+    if ('voiceProvider' in change || 'voiceModel' in change ||
+        change.serviceApiKeys?.speech !== undefined) changed.push('speech');
+    if (changed.length) {
+      setAIServiceStatuses((current) => ({
+        ...current,
+        ...Object.fromEntries(changed.map((service) => [
+          service,
+          { state: 'idle', message: 'Configuração alterada; teste novamente.' }
+        ]))
+      }));
+    }
   };
 
   const clearAIKeys = () => {
     clearFreezoneAIKeys();
-    const apiKeys = { gemini: '', openai: '', deepseek: '', google: '' };
-    setAISettings((current) => ({ ...current, apiKeys }));
+    const apiKeys = { openrouter: '', gemini: '', openai: '', deepseek: '', google: '' };
+    const serviceApiKeys = { movement: '', dialogue: '', speech: '' };
+    const next = { ...aiSettings, apiKeys, serviceApiKeys };
+    setAISettings(next);
+    updateFreezoneAISettings(next);
+    setAIServiceStatuses({
+      movement: { state: 'idle', message: 'Chaves limpas; teste novamente.' },
+      dialogue: { state: 'idle', message: 'Chaves limpas; teste novamente.' },
+      speech: { state: 'idle', message: 'Chaves limpas; teste novamente.' }
+    });
     setAIVoiceStatus('API keys cleared from this session.');
+  };
+
+  const updateAIServiceKey = (service: FreezoneAIService, value: string) => {
+    updateAISettings({
+      serviceApiKeys: { ...aiSettings.serviceApiKeys, [service]: value }
+    });
+  };
+
+  const updateAITextProvider = (
+    service: 'movement' | 'dialogue',
+    provider: FreezoneTextProvider
+  ) => {
+    updateAISettings(service === 'movement'
+      ? { movementProvider: provider, movementModel: FREEZONE_TEXT_MODEL_DEFAULTS[provider] }
+      : { dialogueProvider: provider, dialogueModel: FREEZONE_TEXT_MODEL_DEFAULTS[provider] });
+  };
+
+  const updateAISpeechProvider = (provider: FreezoneSpeechProvider) => {
+    updateAISettings({
+      voiceProvider: provider,
+      voiceModel: FREEZONE_SPEECH_MODEL_DEFAULTS[provider]
+    });
+  };
+
+  const testAIService = async (service: FreezoneAIService) => {
+    const currentRoomCode = hud?.roomCode || roomCode;
+    const playerToken = readLocalSetting('wizard_chess_token');
+    if (!currentRoomCode || !playerToken) {
+      setAIServiceStatuses((current) => ({
+        ...current,
+        [service]: { state: 'error', message: 'Entre em uma sala antes de testar a API.' }
+      }));
+      return;
+    }
+
+    const provider = service === 'movement' ? aiSettings.movementProvider
+      : service === 'dialogue' ? aiSettings.dialogueProvider
+        : aiSettings.voiceProvider;
+    const model = service === 'movement' ? aiSettings.movementModel
+      : service === 'dialogue' ? aiSettings.dialogueModel
+        : aiSettings.voiceModel;
+    const keyProvider: keyof typeof aiSettings.apiKeys = service === 'speech'
+      ? provider === 'google-tts' ? 'google'
+        : provider === 'openai-tts' ? 'openai' : 'gemini'
+      : provider as FreezoneTextProvider;
+    const apiKey = aiSettings.serviceApiKeys[service] || aiSettings.apiKeys[keyProvider] || '';
+    setAIServiceStatuses((current) => ({
+      ...current,
+      [service]: {
+        state: 'checking',
+        message: service === 'movement' ? 'Executando jogada de teste…'
+          : service === 'dialogue' ? 'Gerando texto de teste…'
+            : 'Gerando e reproduzindo áudio…'
+      }
+    }));
+
+    try {
+      const request = { roomCode: currentRoomCode, playerToken, provider, model, apiKey };
+      let successMessage = '';
+      if (service === 'speech') {
+        const audio = await testFreezoneSpeechService(request);
+        if (aiVoiceUrlRef.current) URL.revokeObjectURL(aiVoiceUrlRef.current);
+        aiVoiceUrlRef.current = URL.createObjectURL(audio);
+        if (aiVoiceAudioRef.current) {
+          aiVoiceAudioRef.current.src = aiVoiceUrlRef.current;
+          aiVoiceAudioRef.current.load();
+          try {
+            await aiVoiceAudioRef.current.play();
+            successMessage = 'Áudio de teste gerado e reproduzido.';
+          } catch {
+            successMessage = 'Áudio gerado; use “Play latest voice preview” para reproduzir.';
+            setAIVoiceStatus(successMessage);
+          }
+        } else {
+          successMessage = 'Áudio de teste gerado.';
+        }
+        setAIVoiceReady(true);
+      } else if (service === 'dialogue') {
+        const piece = hud?.ownedPieces[0];
+        if (!piece) throw new Error('Nenhuma peça sua está disponível para o teste de texto.');
+        const result = await testFreezoneAIService({ ...request, service, pieceId: piece.id });
+        if (!result || typeof result.text !== 'string' || !result.text.trim()) {
+          throw new Error('A API não retornou texto para exibir.');
+        }
+        const requestId = `text-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const displayResult = waitForFreezoneAITestResult(requestId, 5000);
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-ai-test-text', {
+          detail: {
+            requestId,
+            pieceId: typeof result.pieceId === 'string' ? result.pieceId : piece.id,
+            text: result.text
+          }
+        }));
+        successMessage = (await displayResult).message;
+      } else {
+        const requestId = `move-test-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const movementResult = waitForFreezoneAITestResult(requestId, 90000);
+        window.dispatchEvent(new CustomEvent('wizard-chess-freezone-ai-test', {
+          detail: { requestId }
+        }));
+        successMessage = (await movementResult).message;
+      }
+      setAIServiceStatuses((current) => ({
+        ...current,
+        [service]: {
+          state: 'ok',
+          message: successMessage || `Teste concluído · ${model || provider}.`
+        }
+      }));
+    } catch (error) {
+      const message = service === 'speech' && error instanceof TypeError &&
+          /failed to fetch/i.test(error.message)
+        ? 'Voz indisponível: verifique se a função freezone-speech está publicada e se o CORS está ativo. Movimento e texto não são afetados.'
+        : error instanceof Error ? error.message : 'Falha ao testar o serviço de IA.';
+      setAIServiceStatuses((current) => ({
+        ...current,
+        [service]: {
+          state: 'error',
+          message: (apiKey ? message.replace(apiKey, '[chave ocultada]') : message).slice(0, 180)
+        }
+      }));
+    }
+  };
+
+  const renderAIServiceStatus = (service: FreezoneAIService) => {
+    const result = aiServiceStatuses[service] || {
+      state: 'idle' as const,
+      message: 'Ainda não testada.'
+    };
+    const label = result.state === 'checking' ? 'Testando'
+      : result.state === 'ok' ? 'Conectada'
+        : result.state === 'error' ? 'Erro'
+          : 'Não testada';
+    return (
+      <div
+        className={`freezone-ai-status is-${result.state}`}
+        role="status"
+        aria-live="polite"
+      >
+        <span className="freezone-ai-status-label">
+          <i aria-hidden="true" />
+          {label}
+        </span>
+        <span className="freezone-ai-status-message">{result.message}</span>
+      </div>
+    );
   };
 
   useEffect(() => {
@@ -407,10 +709,16 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
             }
           }
         } catch (error) {
-          reportAIVoiceStatus(error instanceof Error ? error.message : 'Character voice could not be generated.');
+          const message = error instanceof TypeError && /failed to fetch/i.test(error.message)
+            ? 'Generated voice is unavailable: the freezone-speech function has a deployment or CORS problem. AI movement and text are unaffected.'
+            : error instanceof Error ? error.message : 'Character voice could not be generated.';
+          reportAIVoiceStatus(message);
         }
       }).catch((error: unknown) => {
-        reportAIVoiceStatus(error instanceof Error ? error.message : 'Character voice could not be generated.');
+        const message = error instanceof TypeError && /failed to fetch/i.test(error.message)
+          ? 'Generated voice is unavailable: the freezone-speech function has a deployment or CORS problem. AI movement and text are unaffected.'
+          : error instanceof Error ? error.message : 'Character voice could not be generated.';
+        reportAIVoiceStatus(message);
       });
     };
     const handleVoice = (event: Event) => {
@@ -515,9 +823,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       audio.addEventListener('loadedmetadata', seekToSharedPosition, { once: true });
     }
     if (!audio.paused) return;
-    void audio.play().catch(() => {
+    void audio.play().catch((error: unknown) => {
       setMusicPlaying(false);
-      setStatus('Shared music is on, but autoplay was blocked. Press “Enable audio here” to listen.');
+      setStatus(getFreezoneAudioPlaybackError(error));
     });
   }, [hud?.sharedMusicStartedAt, hud?.sharedMusicUrl, musicSource, sharedMusicPlaying]);
 
@@ -545,6 +853,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       activeFreezoneHudRef.current = enabled;
       setHud(enabled ? detail : null);
       if (enabled !== wasEnabled) setOpen(false);
+      if (typeof detail?.aiBotsEnabled === 'boolean') {
+        setAIBotsEnabled(detail.aiBotsEnabled);
+      }
       if (detail?.roomCode) setRoomCode(detail.roomCode);
       if (detail?.sharedMusicUrl !== undefined) setMusicUrl(detail.sharedMusicUrl);
       if (detail?.sharedMusicPlaying !== undefined) {
@@ -562,6 +873,13 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
       noticeTimer.current = window.setTimeout(() => setNotice(''), 3500);
     };
+    const handleFeedback = (event: Event) => {
+      const message = (event as CustomEvent<string>).detail;
+      if (!message) return;
+      setFeedback(message);
+      if (feedbackTimer.current !== null) window.clearTimeout(feedbackTimer.current);
+      feedbackTimer.current = window.setTimeout(() => setFeedback(''), 2500);
+    };
     const handleSharedMusic = (event: Event) => {
       const detail = (event as CustomEvent<string | {
         url?: string;
@@ -575,13 +893,16 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     window.addEventListener('wizard-chess-freezone-state', handleFreezoneState);
     window.addEventListener('wizard-chess-open-freezone', handleOpenArena);
     window.addEventListener('wizard-chess-freezone-notice', handleNotice);
+    window.addEventListener('wizard-chess-freezone-feedback', handleFeedback);
     window.addEventListener('wizard-chess-freezone-music', handleSharedMusic);
     return () => {
       window.removeEventListener('wizard-chess-freezone-state', handleFreezoneState);
       window.removeEventListener('wizard-chess-open-freezone', handleOpenArena);
       window.removeEventListener('wizard-chess-freezone-notice', handleNotice);
+      window.removeEventListener('wizard-chess-freezone-feedback', handleFeedback);
       window.removeEventListener('wizard-chess-freezone-music', handleSharedMusic);
       if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+      if (feedbackTimer.current !== null) window.clearTimeout(feedbackTimer.current);
     };
   }, []);
 
@@ -873,8 +1194,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       if (sharedMusicPlaying && audio.paused) {
         try {
           await audio.play();
-        } catch {
-          setStatus('This browser could not play the shared audio. Check the URL and try again.');
+        } catch (error) {
+          setStatus(getFreezoneAudioPlaybackError(error));
         }
         return;
       }
@@ -885,24 +1206,22 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
           audio.src = source;
           audio.load();
         }
-        const change = action(nextPlaying);
-        const startPlayback = nextPlaying
-          ? audio.play().catch(() => {
+        if (nextPlaying) {
+          try {
+            await audio.play();
+          } catch (error) {
             setMusicPlaying(false);
-            setStatus('Music is playing for the room. Press “Enable audio here” if autoplay was blocked.');
-          })
-          : Promise.resolve();
-        const result = await change;
+            setStatus(getFreezoneAudioPlaybackError(error));
+            return;
+          }
+        }
+        const result = await action(nextPlaying);
         if (!result.ok) {
           if (nextPlaying) audio.pause();
           setStatus(result.error || 'Could not change shared music playback.');
           return;
         }
-        if (audio.src !== source) {
-          audio.src = source;
-          audio.load();
-        }
-        await startPlayback;
+        if (!nextPlaying) audio.pause();
       } catch (error) {
         setStatus(error instanceof Error ? error.message : 'Could not change shared music playback.');
       } finally {
@@ -918,9 +1237,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     try {
       await audio.play();
       setMusicPlaying(true);
-    } catch {
+    } catch (error) {
       setMusicPlaying(false);
-      setStatus('The browser could not play this audio. Check the link/file and press Play again.');
+      setStatus(getFreezoneAudioPlaybackError(error));
     }
   };
 
@@ -950,15 +1269,101 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }
     setPurchaseBusy(true);
     try {
-      const result = await action(allyRole);
+      const result = await action(allyRole, allyNameDraft);
       setStatus(result.ok
         ? `${FREEZONE_ALLY_LABELS[allyRole]} joined your team.`
         : result.error || 'Could not recruit an allied bot.');
+      if (result.ok) {
+        setAllyNameDraft('');
+        setActiveShopTab('bots');
+      }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not recruit an allied bot.');
     } finally {
       setPurchaseBusy(false);
     }
+  };
+
+  const buyOrb = async (type: FreezonePurchaseOrb) => {
+    const action = window.wizardChess?.buyFreezoneOrb;
+    if (!action) {
+      setStatus('Freezone is still starting. Try again in a moment.');
+      return;
+    }
+    setPurchaseBusy(true);
+    try {
+      const result = await action(type);
+      setStatus(result.ok ? `${type} orb purchased.` : result.error || 'Could not buy this orb.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not buy this orb.');
+    } finally {
+      setPurchaseBusy(false);
+    }
+  };
+
+  const selectPieceForEditing = (pieceId: string) => {
+    const fullPiece = hud?.teamPieces.find((current) => current.id === pieceId);
+    if (!fullPiece) return;
+    const profile = hud?.publicPieces.find((current) => current.id === pieceId) ||
+      hud?.ownedPieces.find((current) => current.id === pieceId);
+    if (!profile) return;
+    setEditingPieceId(fullPiece.id);
+    setPieceName(profile.name);
+    setPieceTitle(profile.title);
+    setPieceDescription(profile.description);
+    setPiecePersonality(profile.personality);
+    setPieceLanguage(profile.language);
+    setPieceAIVoice(profile.aiVoice);
+    setPieceCatchphrase(profile.catchphrase);
+    setAppearance(profile.appearance || FREEZONE_APPEARANCES[0].id);
+    setVoiceLines(profile.voiceLines);
+  };
+
+  const saveEditedPiece = async () => {
+    const action = window.wizardChess?.updateFreezonePieceProfile;
+    if (!action || !editingPieceId) {
+      setStatus('Choose one of your units to edit first.');
+      return;
+    }
+    setPurchaseBusy(true);
+    try {
+      const result = await action(editingPieceId, {
+        name: pieceName,
+        title: pieceTitle,
+        description: pieceDescription,
+        personality: piecePersonality,
+        language: pieceLanguage,
+        aiVoice: pieceAIVoice,
+        catchphrase: pieceCatchphrase,
+        appearance,
+        voiceLines
+      });
+      setStatus(result.ok
+        ? 'Unit profile updated without a purchase.'
+        : result.error || 'Could not save this unit profile.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not save this unit profile.');
+    } finally {
+      setPurchaseBusy(false);
+    }
+  };
+
+  const previewPieceVoice = () => {
+    if (!('speechSynthesis' in window)) {
+      setStatus('Speech preview is not supported in this browser.');
+      return;
+    }
+    const text = pieceCatchphrase.trim() || voiceLines.move.trim() || voiceLines.entry.trim();
+    if (!text) {
+      setStatus('Add a public phrase or voice line before previewing.');
+      return;
+    }
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text.slice(0, 120));
+    utterance.lang = pieceLanguage;
+    utterance.voice = resolveFreezoneVoice(voices, selectedVoiceURI) || null;
+    window.speechSynthesis.speak(utterance);
+    setStatus('Playing a local voice preview on this device only.');
   };
 
   const purchaseUpgrade = async (type: FreezoneUpgrade) => {
@@ -1107,12 +1512,118 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }
   };
 
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined;
+    const updateCompactLeaderboard = () => {
+      setCompactLeaderboard(shouldUseCompactFreezoneLeaderboard(window.innerWidth));
+    };
+    updateCompactLeaderboard();
+    window.addEventListener('resize', updateCompactLeaderboard);
+    return () => window.removeEventListener('resize', updateCompactLeaderboard);
+  }, []);
+
+  useEffect(() => {
+    if (!hud?.enabled) return undefined;
+    const timer = window.setInterval(() => setCooldownNow(Date.now()), 100);
+    return () => window.clearInterval(timer);
+  }, [hud?.enabled]);
+
+  const roomLeaderboard: FreezoneRoomRankingEntry[] = hud?.roomLeaderboard?.length
+    ? hud.roomLeaderboard
+    : (hud?.onlinePlayers || []).map((player, index) => ({
+      ...player,
+      position: index + 1,
+      leader: index === 0,
+      crown: index === 0
+    }));
+
   return (
     <>
       {!mainMenuOpen && hud?.enabled ? (
-        <div className="freezone-hud" aria-live="polite">
+        <>
+          <aside
+            className={`freezone-room-ranking ${compactLeaderboard ? 'compact' : ''} ${rankingCollapsed ? 'collapsed' : ''}`}
+            aria-label="Freezone room ranking"
+          >
+            <div className="freezone-room-ranking-header">
+              <strong>Room rank</strong>
+              {compactLeaderboard && (
+                <button
+                  type="button"
+                  className="freezone-room-ranking-toggle"
+                  onClick={() => setRankingCollapsed((value) => !value)}
+                >
+                  {rankingCollapsed ? 'Expand' : 'Collapse'}
+                </button>
+              )}
+            </div>
+            {!rankingCollapsed && (
+              <div className="freezone-room-ranking-list">
+                {roomLeaderboard.length ? roomLeaderboard.map((player) => (
+                  <div
+                    key={player.side}
+                    className={`freezone-room-ranking-row ${player.leader ? 'leader' : ''}`}
+                  >
+                    <span className="freezone-room-ranking-position">{player.position || 1}</span>
+                    <span className="freezone-room-ranking-name">
+                      {player.leader ? '👑 ' : ''}{player.name}
+                    </span>
+                    <span className="freezone-room-ranking-metric">K {player.kills ?? 0}</span>
+                    <span className="freezone-room-ranking-metric">XP {player.xp ?? 0}</span>
+                    <span className="freezone-room-ranking-metric">Orb {player.orbsCollected ?? 0}</span>
+                    <span className="freezone-room-ranking-metric">Pieces {player.pieces ?? 0}</span>
+                    <span className="freezone-room-ranking-time">
+                      {player.timeLabel || formatFreezoneSessionAge(player.sessionStartedAt || Date.now())}
+                    </span>
+                  </div>
+                )) : (
+                  <div className="freezone-room-empty">No players online.</div>
+                )}
+              </div>
+            )}
+          </aside>
+          <aside className="freezone-piece-cooldowns" aria-label="Your pieces and cooldown energy">
+            <strong>My pieces</strong>
+            {hud.teamPieces.length ? hud.teamPieces.map((piece) => {
+              const remaining = Math.max(0, piece.readyAt - cooldownNow);
+              const duration = Math.max(1, piece.cooldownDurationMs);
+              const energy = Math.max(0, Math.min(100, 100 * (1 - remaining / duration)));
+              const icon = {
+                pawn: '♟',
+                knight: '♞',
+                bishop: '♝',
+                rook: '♜',
+                queen: '♛',
+                king: '♚'
+              }[piece.type] || '♟';
+              return (
+                <div className="freezone-piece-cooldown" key={piece.id}>
+                  <span className="freezone-piece-cooldown-name" title={piece.name}>
+                    <i aria-hidden="true">{icon}</i>{piece.name}
+                    {piece.ally ? <small>Bot</small> : null}
+                  </span>
+                  <span
+                    className="freezone-energy-track"
+                    role="progressbar"
+                    aria-label={`${piece.name} cooldown energy`}
+                    aria-valuemin={0}
+                    aria-valuemax={100}
+                    aria-valuenow={Math.round(energy)}
+                  >
+                    <i style={{ width: `${energy}%` }} />
+                  </span>
+                  <small>{remaining ? `${(remaining / 1000).toFixed(1)}s` : 'Ready'}</small>
+                </div>
+              );
+            }) : <span className="freezone-piece-cooldown-empty">No pieces</span>}
+          </aside>
+          <div className="freezone-hud" aria-live="polite">
           <span className="freezone-hud-stats">
-            XP {hud.xp} · Army {hud.pieces}/{hud.capacity} · Allied bots {hud.allies.length} · Bot orbs {hud.orbBalances.bot}
+            XP {hud.xp} · Army {hud.pieces}/{hud.capacity} ·
+            🔴 {hud.orbBalances.red} · 🔵 {hud.orbBalances.blue} ·
+            🟡 {hud.orbBalances.yellow} · ⚪ {hud.orbBalances.white} ·
+            🟣 {hud.orbBalances.purple} · 🟠 {hud.orbBalances.movement} ·
+            🟢 {hud.orbBalances.bot} · Bots {hud.allies.length}
           </span>
           <span className="freezone-hud-player">
             {hud.playerName}{hud.selectedPieceName ? ` · Selected: ${hud.selectedPieceName}` : ''}
@@ -1199,6 +1710,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
             Piece Shop
           </button>
         </div>
+      </>
       ) : null}
 
       <div
@@ -1227,9 +1739,30 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
 
           {hud ? (
             <>
+              <nav className="freezone-shop-nav" aria-label="Freezone shop sections">
+                {([
+                  ['shop', 'Shop'],
+                  ['bots', 'My bots'],
+                  ['resources', 'Resources'],
+                  ['profile', 'My profile'],
+                  ['api', 'AI & APIs']
+                ] as const).map(([tab, label]) => (
+                  <button
+                    key={tab}
+                    type="button"
+                    aria-current={activeShopTab === tab ? 'page' : undefined}
+                    className={activeShopTab === tab ? 'selected' : ''}
+                    onClick={() => setActiveShopTab(tab)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </nav>
+              {activeShopTab === 'shop' && (
+                <>
               <p className="freezone-description">
                 Landing on an orb stores that resource; pickups never change your skills automatically.
-                Spend XP on regular pieces, colored orbs on upgrades, and green bot orbs to recruit allied bots.
+                Spend XP on pieces, upgrade orbs, or robots. Bought orbs and upgrades are separate choices.
                 Allied bots have their own pieces and do not take room seats or regular army slots.
               </p>
               <div className="freezone-summary">
@@ -1280,12 +1813,21 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                     aria-pressed={aiAssistEnabled}
                     onClick={() => setAIAssistEnabled((enabled) => !enabled)}
                   >
-                    AI teammate moves: {aiAssistEnabled ? 'On' : 'Off'}
+                    AI for my moves: {aiAssistEnabled ? 'On' : 'Off'}
                   </button>
                 </div>
               )}
               <section className="freezone-allies" aria-label="Recruit allied bots">
-                <h3>Recruit a teammate bot · {hud.allyCost} bot orbs</h3>
+                <h3>Recruit a robot · {hud.allyCost} XP</h3>
+                <label>
+                  Unit name (optional)
+                  <input
+                    value={allyNameDraft}
+                    maxLength={32}
+                    placeholder="Default role name"
+                    onChange={(event) => setAllyNameDraft(event.target.value)}
+                  />
+                </label>
                 <label>
                   Bot role
                   <select
@@ -1302,10 +1844,10 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 <button
                   type="button"
                   disabled={!hud.isPlayer || purchaseBusy ||
-                    hud.orbBalances.bot < hud.allyCost}
+                    hud.xp < hud.allyCost}
                   onClick={() => void recruitAlly()}
                 >
-                  Recruit {FREEZONE_ALLY_LABELS[allyRole]} · {hud.allyCost} bot orbs
+                  Recruit robot · {hud.allyCost} XP
                 </button>
                 {hud.allies.length > 0 ? (
                   <ul aria-label="Allied bots on your team">
@@ -1314,9 +1856,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                     ))}
                   </ul>
                 ) : <p>No allied bots recruited yet.</p>}
-                {hud.orbBalances.bot < hud.allyCost && (
+                {hud.xp < hud.allyCost && (
                   <p className="freezone-hint">
-                    Collect {hud.allyCost - hud.orbBalances.bot} more green bot orbs to recruit one.
+                    You need {hud.allyCost - hud.xp} more XP to recruit a robot.
                   </p>
                 )}
               </section>
@@ -1351,6 +1893,35 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   ))}
                 </div>
               )}
+              <section className="freezone-orb-market" aria-label="Buy upgrade orbs">
+                <h3>Buy an orb with XP</h3>
+                <p className="freezone-hint">
+                  Buying adds one orb to your inventory; spend it separately to activate its upgrade.
+                </p>
+                <div className="freezone-orb-market-grid">
+                  {hud.orbEffects.filter((orb) => orb.type !== 'bot').map((orb) => {
+                    const cost = hud.economy.orbCosts[orb.type] ?? 0;
+                    const balance = hud.orbBalances[orb.type] ?? 0;
+                    return (
+                      <article key={orb.type} className="freezone-orb-market-item">
+                        <strong>{orb.label} orb · {cost} XP</strong>
+                        <span>{orb.description}</span>
+                        <small>Available: {balance} · Your XP: {hud.xp}</small>
+                        <button
+                          type="button"
+                          disabled={!hud.isPlayer || purchaseBusy || hud.xp < cost}
+                          onClick={() => void buyOrb(orb.type as FreezonePurchaseOrb)}
+                        >
+                          Buy 1 · {cost} XP
+                        </button>
+                        {hud.xp < cost && (
+                          <small>You need {cost - hud.xp} more XP.</small>
+                        )}
+                      </article>
+                    );
+                  })}
+                </div>
+              </section>
               {!hud.isPlayer ? (
                 <p className="freezone-hint">Spectators cannot buy or upgrade pieces.</p>
               ) : hud.xp < hud.xpCost ? (
@@ -1637,106 +2208,6 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   </div>
                 </details>
                 <details className="freezone-audio-settings">
-                  <summary>AI providers, API keys & generated voices</summary>
-                  <label className="freezone-local-toggle">
-                    <input type="checkbox" checked={aiVoiceEnabled} onChange={(event) => setAIVoiceEnabled(event.target.checked)} />
-                    Enable AI-generated character speech on this device
-                  </label>
-                  <p className="freezone-hint">
-                    AI decisions use the selected text provider once per bot action. The default voice is Gemini Live (gemini-3.8-live); Gemini TTS, OpenAI TTS and Google Cloud TTS are also available. Audio is generated per listener and provider billing/rate limits apply.
-                  </p>
-                  <div className="freezone-designer-fields">
-                    <label>
-                      Strategy and dialogue provider
-                      <select
-                        value={aiSettings.textProvider}
-                        onChange={(event) => updateAISettings({
-                          textProvider: event.target.value as 'gemini' | 'openai' | 'deepseek'
-                        })}
-                      >
-                        <option value="gemini">Gemini</option>
-                        <option value="openai">ChatGPT / OpenAI</option>
-                        <option value="deepseek">DeepSeek</option>
-                      </select>
-                    </label>
-                    <label>
-                      Generated voice provider
-                      <select
-                        value={aiSettings.voiceProvider}
-                        onChange={(event) => updateAISettings({
-                          voiceProvider: event.target.value as 'gemini-live' | 'gemini-tts' | 'openai-tts' | 'google-tts'
-                        })}
-                      >
-                        <option value="gemini-live">Gemini Live — default</option>
-                        <option value="gemini-tts">Gemini TTS</option>
-                        <option value="openai-tts">OpenAI TTS</option>
-                        <option value="google-tts">Google Cloud TTS</option>
-                      </select>
-                    </label>
-                    <label>
-                      Gemini API key (strategy / Gemini voice)
-                      <input
-                        type="password"
-                        autoComplete="new-password"
-                        maxLength={512}
-                        value={aiSettings.apiKeys.gemini}
-                        onChange={(event) => updateAIKey('gemini', event.target.value)}
-                        placeholder="Paste Gemini API key"
-                      />
-                    </label>
-                    <label>
-                      OpenAI API key (ChatGPT / OpenAI TTS)
-                      <input
-                        type="password"
-                        autoComplete="new-password"
-                        maxLength={512}
-                        value={aiSettings.apiKeys.openai}
-                        onChange={(event) => updateAIKey('openai', event.target.value)}
-                        placeholder="Paste OpenAI API key"
-                      />
-                    </label>
-                    <label>
-                      DeepSeek API key
-                      <input
-                        type="password"
-                        autoComplete="new-password"
-                        maxLength={512}
-                        value={aiSettings.apiKeys.deepseek}
-                        onChange={(event) => updateAIKey('deepseek', event.target.value)}
-                        placeholder="Paste DeepSeek API key"
-                      />
-                    </label>
-                    <label>
-                      Google Cloud TTS API key
-                      <input
-                        type="password"
-                        autoComplete="new-password"
-                        maxLength={512}
-                        value={aiSettings.apiKeys.google}
-                        onChange={(event) => updateAIKey('google', event.target.value)}
-                        placeholder="Paste Google Cloud key"
-                      />
-                    </label>
-                  </div>
-                  <p className="freezone-hint">
-                    Keys stay in this browser session only: they are never saved to local storage or synchronized to the room. They are sent over HTTPS to the project’s Supabase Edge Function and used for your provider request. Clear them here or reload the page to remove them.
-                  </p>
-                  <button type="button" onClick={clearAIKeys}>Clear API keys</button>
-                  <button
-                    type="button"
-                    disabled={!aiVoiceEnabled || !aiVoiceReady}
-                    onClick={() => void aiVoiceAudioRef.current?.play().catch(() => {
-                      setAIVoiceStatus('The generated voice could not be played by this browser.');
-                    })}
-                  >
-                    Play latest voice
-                  </button>
-                  <audio ref={aiVoiceAudioRef} onError={() => {
-                    if (aiVoiceReady) setAIVoiceStatus('The generated voice audio could not be played.');
-                  }} />
-                  {aiVoiceStatus && <p className="freezone-hint" aria-live="polite">{aiVoiceStatus}</p>}
-                </details>
-                <details className="freezone-audio-settings">
                   <summary>Freezone music</summary>
                   <label>
                     Local MP3 (this device only)
@@ -1775,7 +2246,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                     onPause={() => setMusicPlaying(false)}
                     onError={() => {
                       setMusicPlaying(false);
-                      setStatus('This file/link is not playable audio. Choose an MP3 or a direct browser-playable audio URL.');
+                      setStatus(getFreezoneAudioPlaybackError());
                     }}
                   />
                   <p className="freezone-hint">
@@ -1976,6 +2447,391 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 </div>
               )}
             </>
+              )}
+              {activeShopTab === 'bots' && (
+                <section className="freezone-shop-page" aria-label="My bots and units">
+                  <h3>My bots and units</h3>
+                  <p className="freezone-hint">
+                    Recruitment costs XP once. Editing a unit profile never charges XP or orbs.
+                  </p>
+                  <label className="freezone-local-toggle">
+                    <input type="checkbox" checked={voiceEnabled} onChange={(event) => setVoiceEnabled(event.target.checked)} />
+                    Enable local speech for piece voice lines on this device
+                  </label>
+                  <p className="freezone-hint">
+                    Text bubbles can appear while speech is off. Configure AI movement, dialogue, and voice separately in AI & APIs.
+                  </p>
+                  <button type="button" onClick={() => setActiveShopTab('api')}>
+                    Configure AI & APIs
+                  </button>
+                  {hud.teamPieces.length ? (
+                    <div className="freezone-my-bots">
+                      {hud.teamPieces.map((piece) => (
+                        <article key={piece.id} className="freezone-my-bot">
+                          <span><strong>{piece.name}</strong> · {piece.type}{piece.ally ? ' · Allied robot' : ''}</span>
+                          <button
+                            type="button"
+                            aria-pressed={editingPieceId === piece.id}
+                            onClick={() => selectPieceForEditing(piece.id)}
+                          >
+                            Edit
+                          </button>
+                        </article>
+                      ))}
+                    </div>
+                  ) : <p className="freezone-empty">You do not control any units yet.</p>}
+                  {!hud.teamPieces.length && (
+                    <button type="button" onClick={() => setActiveShopTab('shop')}>
+                      Open Shop
+                    </button>
+                  )}
+                  {editingPieceId && (
+                    <form
+                      className="freezone-customization freezone-profile-editor"
+                      aria-label="Edit unit profile"
+                      onSubmit={(event) => {
+                        event.preventDefault();
+                        void saveEditedPiece();
+                      }}
+                    >
+                      <h4>Edit {hud.teamPieces.find((piece) => piece.id === editingPieceId)?.name || 'unit'}</h4>
+                      <div className="freezone-designer-fields">
+                        <label>
+                          Unit name
+                          <input value={pieceName} maxLength={32} onChange={(event) => setPieceName(event.target.value)} />
+                        </label>
+                        <label>
+                          Role / title
+                          <input value={pieceTitle} maxLength={32} onChange={(event) => setPieceTitle(event.target.value)} />
+                        </label>
+                        <label>
+                          Appearance
+                          <select value={appearance} onChange={(event) => setAppearance(event.target.value)}>
+                            {FREEZONE_APPEARANCES.map((option) => (
+                              <option value={option.id} key={option.id}>{option.label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          Dialogue language
+                          <select value={pieceLanguage} onChange={(event) => setPieceLanguage(event.target.value)}>
+                            {FREEZONE_AI_LANGUAGES.map(({ id, label }) => (
+                              <option value={id} key={id}>{label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label>
+                          Character voice
+                          <select value={pieceAIVoice} onChange={(event) => setPieceAIVoice(event.target.value)}>
+                            {FREEZONE_AI_VOICES.map(({ id, label }) => (
+                              <option value={id} key={id}>{label}</option>
+                            ))}
+                          </select>
+                        </label>
+                        <label className="freezone-field-wide">
+                          Public description
+                          <textarea value={pieceDescription} maxLength={160} onChange={(event) => setPieceDescription(event.target.value)} />
+                        </label>
+                        <label className="freezone-field-wide">
+                          Personality
+                          <textarea value={piecePersonality} maxLength={240} onChange={(event) => setPiecePersonality(event.target.value)} />
+                        </label>
+                        <label className="freezone-field-wide">
+                          Public phrase
+                          <input value={pieceCatchphrase} maxLength={120} onChange={(event) => setPieceCatchphrase(event.target.value)} />
+                        </label>
+                        {FREEZONE_VOICE_EVENTS.map((event) => (
+                          <label key={event.id}>
+                            {event.label}
+                            <input
+                              value={voiceLines[event.id as VoiceEventKey]}
+                              maxLength={120}
+                              onChange={(change) => setVoiceLines((current) => ({
+                                ...current,
+                                [event.id]: change.target.value.slice(0, 120)
+                              }))}
+                            />
+                          </label>
+                        ))}
+                      </div>
+                      <div className="freezone-profile-actions">
+                        <button type="button" onClick={previewPieceVoice}>Preview locally</button>
+                        <button type="submit" disabled={purchaseBusy}>Save profile</button>
+                      </div>
+                    </form>
+                  )}
+                </section>
+              )}
+              {activeShopTab === 'resources' && (
+                <section className="freezone-shop-page freezone-resources" aria-label="Your resources">
+                  <h3>Resources</h3>
+                  <div className="freezone-resource-xp"><strong>{hud.xp}</strong><span>XP</span></div>
+                  <p>XP is the general game currency. Upgrade orbs remain separate and must be spent explicitly.</p>
+                  <div className="freezone-resource-grid">
+                    {hud.orbEffects.map((orb) => (
+                      <article key={orb.type}>
+                        <strong><i style={{ backgroundColor: orb.color }} />{orb.label} orb</strong>
+                        <b>{hud.orbBalances[orb.type] ?? 0}</b>
+                        <span>{orb.description}</span>
+                      </article>
+                    ))}
+                  </div>
+                </section>
+              )}
+              {activeShopTab === 'profile' && (
+                <section className="freezone-shop-page freezone-player-profile" aria-label="My player profile">
+                  <h3>{hud.playerName} · Player profile</h3>
+                  <dl>
+                    <div><dt>Army capacity</dt><dd>{hud.pieces}/{hud.capacity}</dd></div>
+                    <div><dt>Actions per cycle</dt><dd>{hud.movesPerCycle}</dd></div>
+                    <div><dt>Movement steps per cycle</dt><dd>{hud.stepBudget}</dd></div>
+                    <div><dt>Cooldown</dt><dd>{(hud.cooldownDurationMs / 1000).toFixed(1)} seconds</dd></div>
+                    <div><dt>Movement envelope</dt><dd>{hud.envelopeRows}×{hud.envelopeCols}</dd></div>
+                    <div><dt>Remaining steps</dt><dd>{Math.max(0, hud.stepBudget - hud.stepsUsed)}</dd></div>
+                  </dl>
+                  <h4>Current upgrades</h4>
+                  <p>Red {hud.upgradeLevels.red} · Blue {hud.upgradeLevels.blue} · Yellow {hud.upgradeLevels.yellow} · Purple {hud.upgradeLevels.purple} · White {hud.upgradeLevels.white}</p>
+                  <h4>Unit movement patterns</h4>
+                  {hud.ownedPieces.map((piece) => (
+                    <article key={piece.id}>
+                      <strong>{piece.name}</strong>
+                      <span>{movementText(piece.moves, piece.jumps, piece.teleports, piece.slide)}</span>
+                      <small>{piece.unlockedMoves.length} extra movement offsets</small>
+                    </article>
+                  ))}
+                </section>
+              )}
+              {activeShopTab === 'api' && (
+                <section className="freezone-shop-page freezone-ai-settings" aria-label="AI services and API settings">
+                  <h3>AI services & APIs</h3>
+                  <p className="freezone-hint">
+                    Configure a separate provider, model, and optional key for each function. API keys stay in this browser session; testing a provider may use its API quota.
+                  </p>
+                  <div className="freezone-ai-services">
+                    <article className="freezone-ai-service">
+                      <h4>Movement decisions</h4>
+                      <label className="freezone-local-toggle">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={aiAssistEnabled}
+                          onChange={(event) => setAIAssistEnabled(event.target.checked)}
+                        />
+                        Allow AI to move my unselected pieces
+                      </label>
+                      <label className="freezone-local-toggle">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={aiBotsEnabled}
+                          onChange={(event) => {
+                            const enabled = event.target.checked;
+                            setAIBotsEnabled(enabled);
+                            window.dispatchEvent(new CustomEvent('wizard-chess-freezone-ai-bots', {
+                              detail: enabled
+                            }));
+                          }}
+                        />
+                        Use AI for my purchased bots
+                      </label>
+                      <p className="freezone-hint">
+                        Pieces tagged “AI” may be moved by the assistant. Select one to take control; the AI then waits 20 seconds after your last move or selection before moving another piece. Purchased bots can act as soon as they are ready.
+                      </p>
+                      <label>
+                        Provider
+                        <select
+                          value={aiSettings.movementProvider}
+                          onChange={(event) => updateAITextProvider('movement', event.target.value as FreezoneTextProvider)}
+                        >
+                          <option value="openrouter">OpenRouter</option>
+                          <option value="gemini">Gemini</option>
+                          <option value="openai">OpenAI</option>
+                          <option value="deepseek">DeepSeek</option>
+                        </select>
+                      </label>
+                      <label>
+                        Model ID
+                        <input
+                          list="freezone-movement-models"
+                          value={aiSettings.movementModel}
+                          maxLength={128}
+                          onChange={(event) => updateAISettings({ movementModel: event.target.value })}
+                          placeholder="deepseek/deepseek-v4.1-flash"
+                        />
+                        <datalist id="freezone-movement-models">
+                          <option value="deepseek/deepseek-v4.1-flash" />
+                          <option value="openrouter/free" />
+                          <option value="gemini-2.5-flash" />
+                          <option value="gpt-4o-mini" />
+                          <option value="deepseek-flash" />
+                        </datalist>
+                      </label>
+                      <label>
+                        API key (optional)
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          maxLength={512}
+                          value={aiSettings.serviceApiKeys.movement}
+                          onChange={(event) => updateAIServiceKey('movement', event.target.value)}
+                          placeholder="Vazio usa a chave configurada no servidor"
+                        />
+                      </label>
+                      <div className="freezone-ai-test-row">
+                        <button
+                          type="button"
+                          disabled={aiServiceStatuses.movement?.state === 'checking'}
+                          onClick={() => void testAIService('movement')}
+                        >
+                          Test movement action
+                        </button>
+                        {renderAIServiceStatus('movement')}
+                      </div>
+                    </article>
+
+                    <article className="freezone-ai-service">
+                      <h4>Text generation & dialogue</h4>
+                      <label className="freezone-local-toggle">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={aiSettings.dialogueEnabled}
+                          onChange={(event) => updateAISettings({ dialogueEnabled: event.target.checked })}
+                        />
+                        Generate dialogue with AI
+                      </label>
+                      <p className="freezone-hint">
+                        Turn this off to keep AI movement without making a separate dialogue request. If provider and model match movement, one request handles both.
+                      </p>
+                      <label>
+                        Provider
+                        <select
+                          value={aiSettings.dialogueProvider}
+                          onChange={(event) => updateAITextProvider('dialogue', event.target.value as FreezoneTextProvider)}
+                        >
+                          <option value="openrouter">OpenRouter</option>
+                          <option value="gemini">Gemini</option>
+                          <option value="openai">OpenAI</option>
+                          <option value="deepseek">DeepSeek</option>
+                        </select>
+                      </label>
+                      <label>
+                        Model ID
+                        <input
+                          list="freezone-dialogue-models"
+                          value={aiSettings.dialogueModel}
+                          maxLength={128}
+                          onChange={(event) => updateAISettings({ dialogueModel: event.target.value })}
+                          placeholder="deepseek/deepseek-v4.1-flash"
+                        />
+                        <datalist id="freezone-dialogue-models">
+                          <option value="deepseek/deepseek-v4.1-flash" />
+                          <option value="openrouter/free" />
+                          <option value="gemini-2.5-flash" />
+                          <option value="gpt-4o-mini" />
+                          <option value="deepseek-flash" />
+                        </datalist>
+                      </label>
+                      <label>
+                        API key (optional)
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          maxLength={512}
+                          value={aiSettings.serviceApiKeys.dialogue}
+                          onChange={(event) => updateAIServiceKey('dialogue', event.target.value)}
+                          placeholder="Vazio usa a chave configurada no servidor"
+                        />
+                      </label>
+                      <div className="freezone-ai-test-row">
+                        <button
+                          type="button"
+                          disabled={!aiSettings.dialogueEnabled || aiServiceStatuses.dialogue?.state === 'checking'}
+                          onClick={() => void testAIService('dialogue')}
+                        >
+                          Test text & bubble
+                        </button>
+                        {renderAIServiceStatus('dialogue')}
+                      </div>
+                    </article>
+
+                    <article className="freezone-ai-service">
+                      <h4>Character speech</h4>
+                      <label className="freezone-local-toggle">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={aiVoiceEnabled}
+                          onChange={(event) => setAIVoiceEnabled(event.target.checked)}
+                        />
+                        Enable AI-generated speech on this device
+                      </label>
+                      <label>
+                        Voice provider
+                        <select
+                          value={aiSettings.voiceProvider}
+                          onChange={(event) => updateAISpeechProvider(event.target.value as FreezoneSpeechProvider)}
+                        >
+                          <option value="gemini-live">Gemini Live</option>
+                          <option value="gemini-tts">Gemini TTS</option>
+                          <option value="openai-tts">OpenAI TTS</option>
+                          <option value="google-tts">Google Cloud TTS</option>
+                        </select>
+                      </label>
+                      {aiSettings.voiceProvider !== 'google-tts' && (
+                        <label>
+                          Voice model ID
+                          <input
+                            value={aiSettings.voiceModel}
+                            maxLength={128}
+                            onChange={(event) => updateAISettings({ voiceModel: event.target.value })}
+                            placeholder={FREEZONE_SPEECH_MODEL_DEFAULTS[aiSettings.voiceProvider as FreezoneSpeechProvider]}
+                          />
+                        </label>
+                      )}
+                      <label>
+                        Voice API key (optional)
+                        <input
+                          type="password"
+                          autoComplete="new-password"
+                          maxLength={512}
+                          value={aiSettings.serviceApiKeys.speech}
+                          onChange={(event) => updateAIServiceKey('speech', event.target.value)}
+                          placeholder="Vazio usa a chave configurada no servidor"
+                        />
+                      </label>
+                      <div className="freezone-ai-test-row">
+                        <button
+                          type="button"
+                          disabled={aiServiceStatuses.speech?.state === 'checking'}
+                          onClick={() => void testAIService('speech')}
+                        >
+                          Test audio
+                        </button>
+                        {renderAIServiceStatus('speech')}
+                      </div>
+                      <button
+                        type="button"
+                        disabled={!aiVoiceReady}
+                        onClick={() => void aiVoiceAudioRef.current?.play().catch(() => {
+                          setAIVoiceStatus('The generated voice could not be played by this browser.');
+                        })}
+                      >
+                        Play latest voice preview
+                      </button>
+                      <audio ref={aiVoiceAudioRef} onError={() => {
+                        if (aiVoiceReady) setAIVoiceStatus('The generated voice audio could not be played.');
+                      }} />
+                      {aiVoiceStatus && <p className="freezone-hint" aria-live="polite">{aiVoiceStatus}</p>}
+                    </article>
+                  </div>
+                  <p className="freezone-hint">
+                    Leave a key blank to use the matching Supabase secret. Keys entered here are sent only to Supabase over HTTPS, stay in this session, and are not synchronized to the room. “Clear API keys” clears only browser-session keys, not server secrets.
+                  </p>
+                  <button type="button" onClick={clearAIKeys}>Clear API keys</button>
+                </section>
+              )}
+            </>
           ) : (
             <>
               <p className="freezone-description">
@@ -2001,21 +2857,23 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                       {room.publication?.description && <span>{room.publication.description}</span>}
                       <span>
                         {room.format === 'triangle' ? 'Triangle arena · ' : room.format === 'hexagonal' ? 'Hexagonal arena · ' : 'Square arena · '}
-                        {room.joined} seats claimed · {Math.max(0, room.capacity - room.joined)} slots available · Code {room.code}
+                        {room.online ?? room.joined} online · {room.reconnecting ?? 0} reconnecting · {room.bots ?? 0} bots ·
+                        {' '}{room.staleClaims ?? 0} stale claims to reclaim ·
+                        {' '}{Math.max(0, room.capacity - room.joined)} slots available · Code {room.code}
                       </span>
                       {room.publication?.tags.length ? (
                         <small className="freezone-room-tags">{room.publication.tags.join(' · ')}</small>
                       ) : null}
                       <small className="freezone-room-state">
-                        {room.status === 'active' ? 'In progress' : room.joined >= room.capacity ? 'Full' : 'Open'}
+                        {room.joined >= room.capacity ? 'Full' : room.status === 'active' ? 'In progress' : 'Open'}
                       </small>
                     </div>
                     <button
                       type="button"
-                      disabled={busy || room.joined >= room.capacity}
+                      disabled={busy}
                       onClick={() => void joinArenaCode(room.code)}
                     >
-                      {room.joined >= room.capacity ? 'Full' : 'Join'}
+                      {room.joined >= room.capacity ? 'Join / Rejoin' : 'Join'}
                     </button>
                   </article>
                 ))}
@@ -2052,6 +2910,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       </div>
       <div className={`freezone-toast ${notice ? 'visible' : ''}`} role="status" aria-live="assertive">
         {notice}
+      </div>
+      <div className={`freezone-feedback ${feedback ? 'visible' : ''}`} role="status" aria-live="polite">
+        {feedback}
       </div>
       {inspectedPiece && (
         <div

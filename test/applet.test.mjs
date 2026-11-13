@@ -14,15 +14,20 @@ import {
   FREEZONE_ROOM_TAGS,
   applyFreezoneAllyPurchase,
   configureFreezoneBots,
+  formatFreezoneSessionAge,
+  getFreezoneSeatOccupancy,
   getFreezoneEliminationLeaders,
   getFreezonePlayerLeaderboard,
+  getFreezoneRoomLeaderboard,
   FREEZONE_RECONNECT_GRACE_MS,
   expireFreezoneSessions,
   incrementFreezoneEliminations,
   mergeFreezoneRoomState,
   reconcileFreezonePresence,
+  reclaimStaleFreezoneSeatClaims,
   resolveFreezoneVoice,
   sanitizeFreezoneAIHistory,
+  shouldUseCompactFreezoneLeaderboard,
   sanitizeFreezoneAIDialogue,
   sanitizeFreezoneProfile,
   shouldSpeakFreezoneVoice,
@@ -44,7 +49,9 @@ import {
   updateFreezoneAISettings
 } from '../src/freezoneAISettings.js';
 import {
+  FREEZONE_AI_IDLE_GRACE_MS,
   freezoneAICandidateId,
+  hasFreezoneAIActions,
   normalizeFreezoneAIDecision,
   shouldRequestFreezoneAIVoice
 } from '../src/freezoneAi.js';
@@ -59,6 +66,11 @@ import {
   FREEZONE_MUTANT_DURATION_MS,
   FREEZONE_ORB_TYPES,
   FREEZONE_ORB_TARGET_COUNT,
+  FREEZONE_DEFAULT_ECONOMY,
+  FREEZONE_DEFAULT_ORB_XP,
+  FREEZONE_ALLY_XP_COST,
+  applyFreezoneOrbCollection,
+  applyFreezoneOrbPurchase,
   advanceFreezoneMutantZone,
   applyFreezoneMovementUnlock,
   canUpgradeFreezoneEnvelope,
@@ -77,8 +89,12 @@ import {
   freezoneCapturePhase,
   freezoneFocusPose,
   freezoneMusicElapsedSeconds,
+  getFreezoneEliminationXP,
   normalizeFreezoneMovementLimits,
+  normalizeFreezoneEconomySettings,
   normalizeFreezoneOrbSettings,
+  normalizeFreezoneWallet,
+  resetExpiredFreezoneMoveCycle,
   normalizeFreezoneUnlockedMoves,
   normalizeFreezonePieceCooldowns,
   normalizeFreezoneMutantZone,
@@ -199,8 +215,8 @@ test('Freezone triangle and hexagonal formats restrict valid cells and reject il
 test('Freezone rules normalize orb rewards, movement limits, cooldowns and effective envelopes', () => {
   const legacyOrbs = normalizeFreezoneOrbSettings(null);
   assert.deepEqual(legacyOrbs.enabledTypes, FREEZONE_ORB_TYPES);
-  assert.equal(legacyOrbs.xpByType.xp, 1);
-  assert.equal(legacyOrbs.xpByType.red, 0);
+  assert.equal(legacyOrbs.xpByType.xp, 10);
+  assert.equal(legacyOrbs.xpByType.red, 10);
 
   const orbSettings = normalizeFreezoneOrbSettings({
     enabledTypes: ['red', 'invalid', 'red'],
@@ -243,6 +259,63 @@ test('Freezone rules normalize orb rewards, movement limits, cooldowns and effec
     60000
   );
   assert.equal(normalizeFreezonePieceCooldowns({ king: 90000, pawn: -10 }).pawn, 0);
+});
+
+test('Freezone economy separates XP from orbs and applies expected initial rewards and prices', () => {
+  assert.deepEqual(FREEZONE_DEFAULT_ORB_XP, {
+    xp: 10,
+    red: 10,
+    blue: 10,
+    yellow: 10,
+    purple: 10,
+    white: 10,
+    bot: 10,
+    movement: 10
+  });
+  assert.deepEqual(FREEZONE_DEFAULT_ECONOMY.orbCosts, {
+    red: 200,
+    blue: 200,
+    yellow: 300,
+    white: 400,
+    purple: 500,
+    movement: 250
+  });
+  assert.equal(FREEZONE_DEFAULT_ECONOMY.pieceCostXP, 100);
+  assert.equal(FREEZONE_DEFAULT_ECONOMY.allyCostXP, 600);
+  assert.deepEqual(
+    Object.fromEntries(['pawn', 'knight', 'bishop', 'rook', 'queen', 'king'].map((type) =>
+      [type, getFreezoneEliminationXP(type)]
+    )),
+    { pawn: 300, knight: 350, bishop: 350, rook: 400, queen: 450, king: 500 }
+  );
+  assert.deepEqual(normalizeFreezoneEconomySettings({}).orbCosts, FREEZONE_DEFAULT_ECONOMY.orbCosts);
+
+  const migratedWallet = normalizeFreezoneWallet({
+    xp: 40,
+    orbBalances: { xp: 35, blue: 2, bot: 3 }
+  });
+  assert.equal(migratedWallet.xp, 40);
+  assert.equal(Object.hasOwn(migratedWallet.orbBalances, 'xp'), false);
+  assert.equal(migratedWallet.orbBalances.blue, 2);
+  assert.equal(migratedWallet.orbBalances.bot, 3);
+
+  const xpDust = applyFreezoneOrbCollection({}, 'xp', 10);
+  assert.equal(xpDust.player.xp, 10);
+  assert.equal(Object.values(xpDust.player.orbBalances).reduce((sum, amount) => sum + amount, 0), 0);
+  const blueOrb = applyFreezoneOrbCollection(xpDust.player, 'blue', 10);
+  assert.equal(blueOrb.player.xp, 20);
+  assert.equal(blueOrb.player.orbBalances.blue, 1);
+});
+
+test('Freezone XP orb purchases enforce price and balance without negative currency', () => {
+  const purchase = applyFreezoneOrbPurchase({ xp: 250 }, 'red');
+  assert.equal(purchase.ok, true);
+  assert.equal(purchase.cost, 200);
+  assert.equal(purchase.player.xp, 50);
+  assert.equal(purchase.player.orbBalances.red, 1);
+  assert.equal(applyFreezoneOrbPurchase({ xp: 199 }, 'red').ok, false);
+  assert.equal(applyFreezoneOrbPurchase({ xp: 1000 }, 'bot').ok, false);
+  assert.equal(applyFreezoneOrbPurchase({ xp: -20 }, 'red').ok, false);
 });
 
 test('Freezone movement cards charge a separate orb and count only newly added offsets', () => {
@@ -291,11 +364,11 @@ test('Freezone movement cards charge a separate orb and count only newly added o
   assert.ok(movementOnlyOrbs.every((orb) => orb.type === 'movement'));
 
   const base = {
-    freezonePlayers: { 0: { xp: 0, orbBalances: { movement: 0 } } },
+    freezonePlayers: { 0: { xp: 0, orbBalances: { movement: 0 }, aiBotsEnabled: false } },
     pieces: [{ id: 'piece', moves: [[0, 1]], jumps: [], teleports: [], unlockedMoves: [] }]
   };
   const local = {
-    freezonePlayers: { 0: { xp: 0, orbBalances: { movement: 2 } } },
+    freezonePlayers: { 0: { xp: 0, orbBalances: { movement: 2 }, aiBotsEnabled: true } },
     pieces: [{
       ...base.pieces[0],
       moves: [[0, 1], [1, 0]],
@@ -305,6 +378,7 @@ test('Freezone movement cards charge a separate orb and count only newly added o
   };
   const merged = mergeFreezoneRoomState(base, local, base);
   assert.equal(merged.freezonePlayers[0].orbBalances.movement, 2);
+  assert.equal(merged.freezonePlayers[0].aiBotsEnabled, true);
   assert.deepEqual(merged.pieces[0].unlockedMoves, [[1, 0]]);
 });
 
@@ -596,26 +670,122 @@ test('Freezone appearance selection and public profile are normalized for persis
 });
 
 test('Freezone provider keys stay in session memory and Gemini Live is the default voice', () => {
+  assert.equal(getFreezoneAISettings().textProvider, 'openrouter');
   assert.equal(getFreezoneAISettings().voiceProvider, 'gemini-live');
+  assert.equal(getFreezoneAISettings().movementProvider, 'openrouter');
+  assert.equal(getFreezoneAISettings().dialogueProvider, 'openrouter');
   updateFreezoneAISettings({
-    textProvider: 'gemini',
+    textProvider: 'openrouter',
     voiceProvider: 'gemini-live',
-    apiKeys: { gemini: '', openai: '', deepseek: '', google: '' }
+    apiKeys: { openrouter: '', gemini: '', openai: '', deepseek: '', google: '' }
   });
   assert.equal(getFreezoneAISettings().voiceProvider, 'gemini-live');
   updateFreezoneAISettings({
-    textProvider: 'deepseek',
+    textProvider: 'openrouter',
     voiceProvider: 'openai-tts',
-    apiKeys: { deepseek: 'deepseek-session-key', openai: 'openai-session-key' }
+    apiKeys: { openrouter: 'openrouter-session-key', openai: 'openai-session-key' }
   });
-  assert.equal(getFreezoneAIRequestSettings().textProvider, 'deepseek');
-  assert.equal(getFreezoneAIRequestSettings().textApiKey, 'deepseek-session-key');
+  assert.equal(getFreezoneAIRequestSettings().textProvider, 'openrouter');
+  assert.equal(getFreezoneAIRequestSettings().textApiKey, 'openrouter-session-key');
   assert.equal(getFreezoneAIRequestSettings().voiceProvider, 'openai-tts');
   assert.equal(getFreezoneAIRequestSettings().voiceApiKey, 'openai-session-key');
   clearFreezoneAIKeys();
   assert.equal(getFreezoneAIRequestSettings().textApiKey, '');
   assert.equal(getFreezoneAIRequestSettings().voiceApiKey, '');
   assert.equal(getFreezoneAISettings().apiKeys.google, '');
+});
+
+test('Freezone movement, dialogue, and speech providers have independent models and session keys', () => {
+  updateFreezoneAISettings({
+    movementProvider: 'deepseek',
+    movementModel: 'deepseek-chat',
+    dialogueProvider: 'gemini',
+    dialogueModel: 'gemini-2.5-flash',
+    dialogueEnabled: true,
+    voiceProvider: 'openai-tts',
+    voiceModel: 'gpt-4o-mini-tts',
+    serviceApiKeys: {
+      movement: 'movement-session-key',
+      dialogue: 'dialogue-session-key',
+      speech: 'speech-session-key'
+    }
+  });
+  const request = getFreezoneAIRequestSettings();
+  assert.equal(request.movementProvider, 'deepseek');
+  assert.equal(request.movementModel, 'deepseek-chat');
+  assert.equal(request.movementApiKey, 'movement-session-key');
+  assert.equal(request.dialogueProvider, 'gemini');
+  assert.equal(request.dialogueModel, 'gemini-2.5-flash');
+  assert.equal(request.dialogueApiKey, 'dialogue-session-key');
+  assert.equal(request.voiceProvider, 'openai-tts');
+  assert.equal(request.voiceModel, 'gpt-4o-mini-tts');
+  assert.equal(request.voiceApiKey, 'speech-session-key');
+
+  clearFreezoneAIKeys();
+  updateFreezoneAISettings({
+    movementProvider: 'openrouter',
+    movementModel: 'deepseek/deepseek-v4.1-flash',
+    dialogueProvider: 'openrouter',
+    dialogueModel: 'deepseek/deepseek-v4.1-flash',
+    dialogueEnabled: true,
+    voiceProvider: 'gemini-live',
+    voiceModel: 'models/gemini-3.8-live'
+  });
+});
+
+test('Freezone OpenRouter uses the Supabase secret by default with a paid model and free fallback', () => {
+  const edge = fs.readFileSync(
+    path.join(ROOT, 'supabase/functions/freezone-ai/index.ts'),
+    'utf-8'
+  );
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const speech = fs.readFileSync(
+    path.join(ROOT, 'supabase/functions/freezone-speech/index.ts'),
+    'utf-8'
+  );
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+
+  assert.ok(edge.includes("openrouter: 'OPENROUTER_API_KEY'"));
+  assert.ok(edge.includes("'https://openrouter.ai/api/v1/chat/completions'"));
+  assert.ok(edge.includes("'deepseek/deepseek-v4.1-flash'"));
+  assert.ok(edge.includes("'openrouter/free'"));
+  assert.ok(edge.includes('dialogueProvider'));
+  assert.ok(edge.includes('dialogueApiKey'));
+  assert.ok(edge.includes('let dialogueError ='));
+  assert.ok(edge.includes('dialogueError = error instanceof Error'));
+  assert.ok(edge.includes('The text model returned no dialogue for this move.'));
+  assert.ok(edge.includes('return jsonResponse({ moveId: decision.moveId, lines, dialogueError });'));
+  assert.ok(edge.includes('Generate a test line for the friendly piece named'));
+  assert.ok(edge.includes('pieceId: piece.id, text'));
+  assert.ok(edge.includes("body.action === 'test'"));
+  assert.ok(speech.includes("body.action === 'test'"));
+  assert.ok(panel.includes("['api', 'AI & APIs']"));
+  assert.ok(panel.includes('Test movement action'));
+  assert.ok(panel.includes('Test text & bubble'));
+  assert.ok(panel.includes('Test audio'));
+  assert.ok(panel.includes('aiVoiceAudioRef.current.play()'));
+  assert.ok(panel.includes('waitForFreezoneAITestResult(requestId, 90000)'));
+  assert.ok(panel.includes('wizard-chess-freezone-ai-test-text'));
+  assert.ok(engine.includes('wizard-chess-freezone-ai-test-text'));
+  assert.ok(engine.includes('wizard-chess-freezone-ai-test'));
+  assert.ok(engine.includes('Test move completed with'));
+  const dialogueQueueStart = engine.indexOf('function queueFreezoneAIDialogue');
+  const dialogueQueueEnd = engine.indexOf('function updateFreezoneSpeech', dialogueQueueStart);
+  assert.ok(engine.slice(dialogueQueueStart, dialogueQueueEnd).includes('updateFreezoneSpeech();'));
+  assert.ok(panel.includes('Use AI for my purchased bots'));
+  assert.ok(panel.includes('serviceApiKeys.movement'));
+  assert.ok(panel.includes('serviceApiKeys.dialogue'));
+  assert.ok(panel.includes('serviceApiKeys.speech'));
+  assert.ok(panel.includes('the freezone-speech function has a deployment or CORS problem'));
+  assert.ok(panel.includes('AI movement and text are unaffected.'));
+  assert.ok(styles.includes('.freezone-ai-status.is-ok'));
+  assert.ok(styles.includes('.freezone-ai-status.is-error'));
+  assert.ok(engine.includes('moveScope === \'bots\' ? !piece.freezoneAllyId'));
+  assert.ok(engine.includes('scheduleFreezoneAIIdleAction'));
+  assert.ok(engine.includes("wizard-chess-freezone-ai-bots"));
+  assert.ok(edge.includes('Boolean(piece.allyId)'));
+  assert.equal(FREEZONE_AI_IDLE_GRACE_MS, 20000);
 });
 
 test('Freezone room merge preserves synced profile and elimination fields', () => {
@@ -723,6 +893,28 @@ test('Freezone AI can only choose a legal candidate and optional speech respects
   assert.equal(staleSave.aiDialogue.id, 'dialogue-2');
 });
 
+test('Freezone AI teammate skips a resting or exhausted action cycle', () => {
+  const now = 10_000;
+  const readyPlayer = {
+    movesPerCycle: 2,
+    movesUsed: 1,
+    stepBudget: 3,
+    stepsUsed: 1,
+    cooldownUntil: 0
+  };
+  assert.equal(hasFreezoneAIActions(readyPlayer, now), true);
+  assert.equal(hasFreezoneAIActions({ ...readyPlayer, movesUsed: 2 }, now), false);
+  assert.equal(hasFreezoneAIActions({ ...readyPlayer, stepsUsed: 3 }, now), false);
+  assert.equal(hasFreezoneAIActions({ ...readyPlayer, cooldownUntil: now + 1 }, now), false);
+
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const requestStart = engine.indexOf('async function requestFreezoneAITeammateAction');
+  const requestEnd = engine.indexOf('function focusFreezonePiece', requestStart);
+  const request = engine.slice(requestStart, requestEnd);
+  assert.ok(request.indexOf('if (!hasFreezoneAIActions(player)) return;') <
+    request.indexOf('requestFreezoneAIMove({'));
+});
+
 test('Concurrent Freezone pickup claims award an orb to only one side after room merge', () => {
   const base = {
     pieces: [],
@@ -736,25 +928,43 @@ test('Concurrent Freezone pickup claims award an orb to only one side after room
   const local = {
     ...base,
     xpOrbs: [],
-    orbClaims: [{ orbId: 'orb-one', side: 0, type: 'xp', amount: 1 }],
+    orbClaims: [{ orbId: 'orb-one', side: 0, type: 'xp', amount: 10, xpAmount: 10 }],
     freezonePlayers: {
-      0: { xp: 1, orbBalances: { xp: 1 } },
+      0: { xp: 10, orbBalances: { xp: 10 } },
       1: { xp: 0, orbBalances: { xp: 0 } }
     }
   };
   const current = {
     ...base,
     xpOrbs: [],
-    orbClaims: [{ orbId: 'orb-one', side: 1, type: 'xp', amount: 1 }],
+    orbClaims: [{ orbId: 'orb-one', side: 1, type: 'xp', amount: 10, xpAmount: 10 }],
     freezonePlayers: {
       0: { xp: 0, orbBalances: { xp: 0 } },
-      1: { xp: 1, orbBalances: { xp: 1 } }
+      1: { xp: 10, orbBalances: { xp: 10 } }
     }
   };
   const merged = mergeFreezoneRoomState(base, local, current);
-  assert.equal(merged.freezonePlayers[0].xp + merged.freezonePlayers[1].xp, 1);
+  assert.equal(merged.freezonePlayers[0].xp + merged.freezonePlayers[1].xp, 10);
   assert.deepEqual(merged.orbClaims, current.orbClaims);
   assert.equal(merged.xpOrbs.length, 0);
+});
+
+test('Concurrent same-player Freezone orb synchronization does not duplicate its reward', () => {
+  const base = {
+    xpOrbs: [{ id: 'orb-one', r: 4, c: 4, type: 'red' }],
+    orbClaims: [],
+    freezonePlayers: { 0: { xp: 0, orbBalances: { red: 0 } } }
+  };
+  const collected = {
+    ...base,
+    xpOrbs: [],
+    orbClaims: [{ orbId: 'orb-one', side: 0, type: 'red', amount: 1, xpAmount: 10 }],
+    freezonePlayers: { 0: { xp: 10, orbBalances: { red: 1 } } }
+  };
+  const merged = mergeFreezoneRoomState(base, collected, collected);
+  assert.equal(merged.freezonePlayers[0].xp, 10);
+  assert.equal(merged.freezonePlayers[0].orbBalances.red, 1);
+  assert.equal(merged.orbClaims.length, 1);
 });
 
 test('Concurrent bot-orb pickups synchronize the dedicated ally currency once', () => {
@@ -800,6 +1010,69 @@ test('Freezone eliminations increment once and retain ties for the leaders displ
       { id: 'b', name: 'B', eliminations: 2 }
     ]
   });
+});
+
+test('Concurrent Freezone elimination records pay XP and count the kill only once', () => {
+  const base = {
+    freezonePlayers: { 0: { xp: 0 }, 1: { xp: 0 } },
+    eliminationRecords: [],
+    eliminationRewards: []
+  };
+  const event = {
+    id: 'capture:victim-1',
+    side: 0,
+    attackerPieceId: 'attacker-1',
+    victimType: 'pawn',
+    xp: 300
+  };
+  const updated = {
+    ...base,
+    freezonePlayers: { 0: { xp: 300 }, 1: { xp: 0 } },
+    eliminationRecords: [{ id: 'attacker-1', side: 0, type: 'rook', eliminations: 1 }],
+    eliminationRewards: [event]
+  };
+  const merged = mergeFreezoneRoomState(base, updated, updated);
+  assert.equal(merged.freezonePlayers[0].xp, 300);
+  assert.equal(merged.eliminationRewards.length, 1);
+  assert.equal(merged.eliminationRecords[0].eliminations, 1);
+});
+
+test('Competing Freezone elimination synchronizations refund the losing XP and kill', () => {
+  const base = {
+    freezonePlayers: { 0: { xp: 0 }, 1: { xp: 0 } },
+    eliminationRecords: [],
+    eliminationRewards: []
+  };
+  const local = {
+    ...base,
+    freezonePlayers: { 0: { xp: 300 }, 1: { xp: 0 } },
+    eliminationRecords: [{ id: 'attacker-0', side: 0, type: 'rook', eliminations: 1 }],
+    eliminationRewards: [{
+      id: 'capture:victim-1',
+      side: 0,
+      attackerPieceId: 'attacker-0',
+      victimType: 'pawn',
+      xp: 300
+    }]
+  };
+  const current = {
+    ...base,
+    freezonePlayers: { 0: { xp: 0 }, 1: { xp: 300 } },
+    eliminationRecords: [{ id: 'attacker-1', side: 1, type: 'bishop', eliminations: 1 }],
+    eliminationRewards: [{
+      id: 'capture:victim-1',
+      side: 1,
+      attackerPieceId: 'attacker-1',
+      victimType: 'pawn',
+      xp: 300
+    }]
+  };
+  const merged = mergeFreezoneRoomState(base, local, current);
+  assert.equal(merged.eliminationRewards.length, 1);
+  assert.equal(merged.freezonePlayers[0].xp, 0);
+  assert.equal(merged.freezonePlayers[1].xp, 300);
+  assert.equal(merged.eliminationRecords.find((record) => record.side === 0).eliminations, 0);
+  assert.equal(merged.eliminationRecords.find((record) => record.side === 1).eliminations, 1);
 });
 
 test('Freezone player leaderboard includes active players with zero eliminations', () => {
@@ -851,6 +1124,37 @@ test('Freezone reconnect grace starts when presence detects departure, not stale
   assert.equal(expired.eliminationRecords.length, 0);
 });
 
+test('Freezone seat occupancy distinguishes online, reconnecting and stale claims', () => {
+  const now = 2_000_000;
+  const state = {
+    seats: [
+      { token: 'online', lastSeenAt: now - 10_000 },
+      { token: 'recently-left', lastSeenAt: now - 90_000 },
+      { token: 'reconnecting', lastSeenAt: now - 200_000, reconnectUntil: now + 30_000 },
+      { token: 'stale', lastSeenAt: now - 5 * FREEZONE_RECONNECT_GRACE_MS },
+      { token: 'legacy-stale' },
+      { token: 'bot-seat', bot: true }
+    ],
+    freezoneDepartures: {
+      reconnecting: { side: 2, expiresAt: now + 30_000 }
+    }
+  };
+  assert.deepEqual(getFreezoneSeatOccupancy(state, now), {
+    claimed: 6,
+    online: 1,
+    reconnecting: 2,
+    bots: 1,
+    staleClaims: 2,
+    occupied: 4
+  });
+
+  const reclaimed = reclaimStaleFreezoneSeatClaims(state, ['online'], now);
+  assert.deepEqual(
+    reclaimed.seats.map((seat) => seat?.token || null),
+    ['online', 'recently-left', 'reconnecting', null, null, 'bot-seat']
+  );
+});
+
 test('Freezone presence and AI controls are wired with bots disabled by default', () => {
   const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
   const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
@@ -861,15 +1165,20 @@ test('Freezone presence and AI controls are wired with bots disabled by default'
   assert.ok(engine.includes('Their pieces are removed; they can reconnect for 3 minutes.'));
   assert.ok(engine.includes('botsEnabled: false'));
   assert.ok(engine.includes('setFreezoneBotsEnabled,'));
-  assert.ok(engine.includes('async function buyFreezoneAlly(role)'));
+  assert.ok(engine.includes('async function buyFreezoneAlly(role, requestedName = \'\')'));
   assert.ok(engine.includes('chooseFreezoneAllyMove'));
-  assert.ok(panel.includes('Recruit a teammate bot'));
+  assert.ok(panel.includes('Recruit a robot'));
   assert.ok(panel.includes('className="freezone-hud-bots"'));
   assert.ok(engine.includes('let freezoneAIAssistEnabled = false;'));
   assert.ok(panel.includes("readLocalSetting('freezone-ai-assist-enabled') === 'true'"));
   assert.ok(panel.includes('Player elimination ranking'));
   assert.ok(multiplayer.includes(".on('presence', { event: 'join' }, publishPresence)"));
   assert.ok(multiplayer.includes(".on('presence', { event: 'leave' }, publishPresence)"));
+  assert.ok(multiplayer.includes('getFreezoneSeatOccupancy'));
+  assert.ok(multiplayer.includes('getFreezonePresenceSnapshot(room.id, playerToken)'));
+  assert.ok(multiplayer.includes('reclaimStaleFreezoneSeatClaims'));
+  assert.ok(panel.includes('Join / Rejoin'));
+  assert.ok(panel.includes('stale claims to reclaim'));
 });
 
 test('Freezone adversary bots default off, fill no more than two free seats, and preserve human progress', () => {
@@ -949,7 +1258,7 @@ test('Freezone bot removal survives room merge and removes the bot avatar state'
   assert.equal(merged.freezonePlayers[1], undefined);
 });
 
-test('Freezone allied bot recruitment costs 10 dedicated orbs and has no separate roster cap', () => {
+test('Freezone allied bot recruitment costs XP directly and preserves legacy bot orbs', () => {
   const recruit = (player, id, role = 'strategic') => applyFreezoneAllyPurchase(player, {
     id,
     pieceId: `piece-${id}`,
@@ -957,17 +1266,20 @@ test('Freezone allied bot recruitment costs 10 dedicated orbs and has no separat
     role
   });
   assert.equal(FREEZONE_ALLY_COST, 10);
+  assert.equal(FREEZONE_ALLY_XP_COST, 600);
   assert.equal(FREEZONE_ALLY_ROLES.length, 5);
-  const funded = { orbBalances: { bot: 30 }, allies: [] };
+  const funded = { xp: 1800, orbBalances: { bot: 30 }, allies: [] };
   const first = recruit(funded, 'first');
   assert.equal(first.ok, true);
-  assert.equal(first.player.orbBalances.bot, 20);
+  assert.equal(first.player.xp, 1200);
+  assert.equal(first.player.orbBalances.bot, 30);
   const second = recruit(first.player, 'second', 'guardian');
   const third = recruit(second.player, 'third', 'collector');
   assert.equal(third.ok, true);
-  assert.equal(third.player.orbBalances.bot, 0);
+  assert.equal(third.player.xp, 0);
+  assert.equal(third.player.orbBalances.bot, 30);
   assert.equal(third.player.allies.length, 3);
-  assert.equal(recruit({ orbBalances: { bot: 9 }, allies: [] }, 'poor').ok, false);
+  assert.equal(recruit({ xp: 599, orbBalances: { bot: 30 }, allies: [] }, 'poor').ok, false);
   assert.match(recruit(first.player, 'first').error, /already been recruited/);
 });
 
@@ -1032,7 +1344,7 @@ test('Freezone collector seeks bot orbs while a guardian favors proximity to its
 
 test('Freezone ally purchase persists its roster and balance through room-state merge', () => {
   const base = {
-    freezonePlayers: { 0: { orbBalances: { bot: 10 }, allies: [] } },
+    freezonePlayers: { 0: { xp: 600, orbBalances: { bot: 10 }, allies: [] } },
     pieces: [],
     xpOrbs: []
   };
@@ -1055,7 +1367,8 @@ test('Freezone ally purchase persists its roster and balance through room-state 
     }]
   };
   const merged = mergeFreezoneRoomState(base, local, base);
-  assert.equal(merged.freezonePlayers[0].orbBalances.bot, 0);
+  assert.equal(merged.freezonePlayers[0].xp, 0);
+  assert.equal(merged.freezonePlayers[0].orbBalances.bot, 10);
   assert.equal(merged.freezonePlayers[0].allies[0].role, 'guardian');
   assert.equal(merged.pieces[0].allyId, 'ally-0-1');
 });
@@ -1088,7 +1401,7 @@ test('Freezone room merge deduplicates allied bot records and keeps concurrent r
 
 test('Freezone concurrent re-recruit attempts with the same side roster slot merge once', () => {
   const base = {
-    freezonePlayers: { 0: { orbBalances: { bot: 10 }, allies: [] } },
+    freezonePlayers: { 0: { xp: 1200, orbBalances: { bot: 10 }, allies: [] } },
     pieces: [],
     xpOrbs: []
   };
@@ -1105,7 +1418,8 @@ test('Freezone concurrent re-recruit attempts with the same side roster slot mer
     pieces: [{ id: ally.pieceId, side: 0, r: 1, c: 1, allyId: ally.id, allyRole: ally.role }]
   };
   const merged = mergeFreezoneRoomState(base, local, remote);
-  assert.equal(merged.freezonePlayers[0].orbBalances.bot, 0);
+  assert.equal(merged.freezonePlayers[0].xp, 600);
+  assert.equal(merged.freezonePlayers[0].orbBalances.bot, 10);
   assert.equal(merged.freezonePlayers[0].allies.length, 1);
   assert.equal(merged.pieces.length, 1);
 });
@@ -1155,6 +1469,22 @@ test('Freezone drag, jump, teleport and envelope step budgets are evaluated inde
   });
   assert.equal(blockedJump.some((move) => move.kind === 'jump'), false);
   assert.equal(blockedJump.some((move) => move.kind === 'teleport'), true);
+});
+
+test('Freezone movement and AI action budgets reset when the cooldown expires', () => {
+  const restingPlayer = {
+    movesUsed: 2,
+    stepsUsed: 4,
+    cooldownUntil: 5000,
+    movedPieceIds: ['piece-a', 'piece-b']
+  };
+  assert.equal(resetExpiredFreezoneMoveCycle(restingPlayer, 4999), restingPlayer);
+  assert.deepEqual(resetExpiredFreezoneMoveCycle(restingPlayer, 5000), {
+    movesUsed: 0,
+    stepsUsed: 0,
+    cooldownUntil: 0,
+    movedPieceIds: []
+  });
 });
 
 test('Freezone mutant zone uses synchronized duration and expires without a replacement', () => {
@@ -1210,7 +1540,7 @@ test('Freezone room merge refunds currency and configured XP for a losing orb cl
 
   const merged = mergeFreezoneRoomState(base, local, current);
   assert.equal(merged.freezonePlayers[0].xp, 5);
-  assert.equal(merged.freezonePlayers[0].orbBalances.xp, 5);
+  assert.equal(Object.prototype.hasOwnProperty.call(merged.freezonePlayers[0].orbBalances, 'xp'), false);
   assert.equal(merged.freezonePlayers[0].orbBalances.red, 0);
   assert.equal(merged.orbClaims[0].side, 1);
 });
@@ -1223,6 +1553,21 @@ test('Freezone shared audio accepts HTTP URLs and bounded MP3 files only', () =>
   assert.equal(validateFreezoneAudioFile({ name: 'music.mp3', type: 'audio/mpeg', size: 1024 }).ok, true);
   assert.equal(validateFreezoneAudioFile({ name: 'movie.mp3', type: 'video/mp4', size: 1024 }).ok, false);
   assert.equal(validateFreezoneAudioFile({ name: 'large.mp3', type: 'audio/mpeg', size: 21 * 1024 * 1024 }).ok, false);
+});
+
+test('Freezone shared playback reports unstreamable URLs before syncing the room state', () => {
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const toggleStart = panel.indexOf('const toggleMusic =');
+  const toggleEnd = panel.indexOf('const toggleBots =', toggleStart);
+  const toggle = panel.slice(toggleStart, toggleEnd);
+  const startPlayback = toggle.indexOf('await audio.play();', toggle.indexOf('const nextPlaying'));
+  const playbackError = toggle.indexOf('setStatus(getFreezoneAudioPlaybackError(error));', startPlayback);
+  const syncPlayback = toggle.indexOf('const result = await action(nextPlaying);');
+
+  assert.ok(startPlayback >= 0);
+  assert.ok(playbackError > startPlayback && playbackError < syncPlayback);
+  assert.ok(toggle.slice(playbackError, syncPlayback).includes('return;'));
+  assert.ok(panel.includes('The server may offer it as a download'));
 });
 
 test('Freezone room merge synchronizes shared music playback and pause restores visual state', () => {
@@ -1307,8 +1652,113 @@ test('Freezone camera keeps a comfortable distance when re-framing a moved piece
   assert.ok(pose.position.every(Number.isFinite));
 });
 
+test('Freezone room leaderboard includes only online players, keeps tied leaders together and counts zeroed stats', () => {
+  const now = 1_700_000_000_000;
+  const state = {
+    botsEnabled: true,
+    seats: [
+      { token: 'alpha', name: 'Alpha' },
+      { token: 'bravo', name: 'Bravo' },
+      { token: 'charlie', name: 'Charlie', bot: true },
+      { token: 'delta', name: 'Delta' }
+    ],
+    freezonePlayers: {
+      0: { xp: 0, sessionStartedAt: now - 5 * 60 * 1000 },
+      1: { xp: 7, sessionStartedAt: now - 12 * 60 * 1000 },
+      2: { xp: 7, sessionStartedAt: now - 8 * 60 * 1000 },
+      3: { xp: 0, sessionStartedAt: now - 4 * 60 * 1000 }
+    },
+    eliminationRecords: [
+      { id: 'a1', side: 0, eliminations: 0 },
+      { id: 'b1', side: 1, eliminations: 2 },
+      { id: 'b2', side: 1, eliminations: 0 },
+      { id: 'c1', side: 2, eliminations: 2 },
+      { id: 'd1', side: 3, eliminations: 0 }
+    ],
+    orbClaims: [
+      { side: 0, amount: 0 },
+      { side: 1, amount: 3 },
+      { side: 2, amount: 3 },
+      { side: 3, amount: 0 }
+    ],
+    pieces: [
+      { side: 0 },
+      { side: 1 },
+      { side: 1 },
+      { side: 2 },
+      { side: 2 },
+      { side: 3 }
+    ]
+  };
+
+  const ranking = getFreezoneRoomLeaderboard(
+    state,
+    [{ token: 'alpha' }, { token: 'bravo' }, { token: 'charlie' }],
+    now
+  );
+
+  assert.deepEqual(ranking.map((entry) => entry.name), ['Bravo', 'Charlie', 'Alpha']);
+  assert.deepEqual(ranking.map((entry) => entry.position), [1, 1, 3]);
+  assert.equal(ranking[0].leader, true);
+  assert.equal(ranking[1].leader, true);
+  assert.equal(ranking[2].leader, false);
+  assert.equal(ranking[2].kills, 0);
+  assert.equal(ranking[2].xp, 0);
+  assert.equal(ranking[2].orbsCollected, 0);
+  assert.equal(ranking[2].pieces, 1);
+});
+
+test('Freezone room leaderboard counts kills once, uses collected orb totals and keeps session time after reconnects', () => {
+  const now = 1_700_000_000_000;
+  const state = {
+    seats: [
+      { token: 'solo', name: 'Solo' },
+      { token: 'rival', name: 'Rival' }
+    ],
+    freezonePlayers: {
+      0: { xp: 24, orbBalances: { red: 1, xp: 15 }, sessionStartedAt: now - 75 * 60 * 1000 },
+      1: { xp: 9, orbBalances: { red: 0, xp: 9 }, sessionStartedAt: now - 30 * 60 * 1000 }
+    },
+    eliminationRecords: [
+      { id: 'solo-1', side: 0, eliminations: 2 },
+      { id: 'solo-2', side: 0, eliminations: 1 },
+      { id: 'rival-1', side: 1, eliminations: 1 }
+    ],
+    orbClaims: [
+      { side: 0, type: 'red', amount: 3, xpAmount: 2 },
+      { side: 0, type: 'xp', amount: 8, xpAmount: 8 },
+      { side: 1, type: 'red', amount: 1, xpAmount: 2 }
+    ],
+    pieces: [
+      { side: 0 },
+      { side: 0 },
+      { side: 1 }
+    ]
+  };
+
+  const ranking = getFreezoneRoomLeaderboard(state, [{ token: 'solo' }, { token: 'rival' }], now);
+  const solo = ranking.find((entry) => entry.side === 0);
+  const rival = ranking.find((entry) => entry.side === 1);
+  assert.equal(solo.kills, 3);
+  assert.equal(solo.xp, 24);
+  assert.equal(solo.orbsCollected, 11);
+  assert.equal(solo.pieces, 2);
+  assert.equal(solo.timeLabel, '1 h 15 min');
+  assert.equal(rival.orbsCollected, 1);
+  assert.equal(formatFreezoneSessionAge(state.freezonePlayers[0].sessionStartedAt, now), '1 h 15 min');
+});
+
+test('Freezone leaderboard compact mode and session formatting stay predictable on small screens', () => {
+  assert.equal(shouldUseCompactFreezoneLeaderboard(720), true);
+  assert.equal(shouldUseCompactFreezoneLeaderboard(760), false);
+  assert.equal(shouldUseCompactFreezoneLeaderboard(1024), false);
+  assert.equal(formatFreezoneSessionAge(Date.now() - 5 * 60 * 1000, Date.now()), '5 min');
+  assert.equal(formatFreezoneSessionAge(Date.now() - 2 * 60 * 60 * 1000 - 15 * 60 * 1000, Date.now()), '2 h 15 min');
+});
+
 test('Freezone shop stays open through repeated HUD updates', () => {
   const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
   const handlerStart = panel.indexOf('const handleFreezoneState =');
   const handlerEnd = panel.indexOf('const handleOpenArena =', handlerStart);
   const handler = panel.slice(handlerStart, handlerEnd);
@@ -1316,6 +1766,17 @@ test('Freezone shop stays open through repeated HUD updates', () => {
   assert.ok(handler.includes('activeFreezoneHudRef.current'));
   assert.ok(handler.includes('if (enabled !== wasEnabled) setOpen(false)'));
   assert.ok(!handler.includes('if (detail?.enabled) setOpen(false)'));
+  assert.ok(panel.includes("['shop', 'Shop']"));
+  assert.ok(panel.includes("['bots', 'My bots']"));
+  assert.ok(panel.includes("['resources', 'Resources']"));
+  assert.ok(panel.includes("['profile', 'My profile']"));
+  assert.ok(panel.includes('window.speechSynthesis.speak(utterance)'));
+  assert.ok(panel.includes('Enable local speech for piece voice lines on this device'));
+  assert.ok(panel.includes('Text bubbles can appear while speech is off.'));
+  assert.ok(panel.includes('Unit profile updated without a purchase.'));
+  assert.ok(styles.includes('.freezone-shop-nav'));
+  assert.ok(styles.includes('@media (max-width: 420px)'));
+  assert.ok(styles.includes('.freezone-piece-cooldowns'));
 });
 
 test('Freezone selection persists for repeat moves and entry camera focuses the player team', () => {
@@ -1337,8 +1798,51 @@ test('Freezone selection persists for repeat moves and entry camera focuses the 
   assert.ok(engine.includes('requestFreezoneAIMove'));
   assert.ok(engine.includes('handleCustomModeClick(\n          { clientX: -1, clientY: -1 }'));
   assert.ok(engine.includes("if (selectedPiece && customGameConfig.gameMode !== 'freezone')"));
+  assert.ok(engine.includes('choose one of the ${legalMoves.length} highlighted squares.'));
+  assert.ok(engine.includes('showSquareHighlights(\n            selectedPiece.r,'));
+  assert.ok(engine.includes('isAnimatingMove) {\n        return;\n      }\n\n      if (room.free_mode_state?.enabled)'));
+  assert.ok(engine.includes('setFreeMode(true, savedState, true)'));
+  assert.ok(engine.includes('const readyAt = Math.max(player.cooldownUntil, piece.freeCooldownUntil || 0)'));
   const canMoveStart = engine.indexOf('function canMoveFreezonePiece');
   const canMoveEnd = engine.indexOf('function recordFreezoneMove', canMoveStart);
   assert.ok(!engine.slice(canMoveStart, canMoveEnd).includes('movedPieceIds.includes'));
   assert.ok(engine.includes('Spend one to gain one more move action per cycle'));
+});
+
+test('Freezone AI controls stay visible and manual movement resumes after cooldowns', () => {
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const clickStart = engine.indexOf('function handleCustomModeClick');
+  const clickEnd = engine.indexOf('function handleFreeModeClick', clickStart);
+  const clickHandler = engine.slice(clickStart, clickEnd);
+  const aiStart = engine.indexOf('async function requestFreezoneAITeammateAction');
+  const aiEnd = engine.indexOf('function scheduleFreezoneAIIdleAction', aiStart);
+  const aiRequest = engine.slice(aiStart, aiEnd);
+
+  assert.ok(clickHandler.includes('if (isAnimatingMove) return;'));
+  assert.ok(!clickHandler.includes('freezoneAIDialogueBusy && !forcedMove'));
+  assert.ok(clickHandler.includes('cancelPendingFreezoneAIRequest();'));
+  assert.ok(aiRequest.includes('requestGeneration !== freezoneAIRequestGeneration'));
+  assert.ok(aiRequest.includes('if (isAnimatingMove)'));
+  assert.ok(aiRequest.includes('response?.dialogueError'));
+  assert.ok(aiRequest.includes('scheduleFreezoneAIAnimationRetry'));
+  assert.ok(aiRequest.includes('scheduleFreezoneAIRequestRetry'));
+  assert.ok(aiRequest.includes('retryAttempt < 1'));
+  assert.ok(aiRequest.includes('AI request failed temporarily; retrying once.'));
+  assert.ok(engine.includes('wizard-chess-freezone-ai-test-result'));
+  assert.ok(engine.includes('aiTestRequestId: testRequestId'));
+  assert.ok(aiRequest.includes('const moveStarted = handleCustomModeClick('));
+  assert.ok(aiRequest.includes('if (!moveStarted)'));
+  assert.ok(engine.includes('function scheduleFreezoneAIAnimationRetry'));
+  assert.ok(engine.includes('detail: `AI text: ${generatedText}`'));
+  assert.ok(engine.includes('new THREE.CircleGeometry(freeModeActive ? 0.15 : 0.06, 24)'));
+  assert.ok(engine.includes('new THREE.RingGeometry(0.27, 0.34, 32)'));
+  assert.ok(engine.includes('depthTest: !freeModeActive'));
+  assert.ok(engine.includes("cancelPendingFreezoneAIRequest('army')"));
+  assert.ok(engine.includes('scheduleFreezoneAIIdleAction(protectedPiece.freeId, null)'));
+  assert.ok(engine.includes("const label = aiControlled ? `AI · ${name}` : name;"));
+  assert.ok(engine.includes('AI assist off. Select a piece and choose one of its highlighted destinations.'));
+  assert.ok(engine.includes('AI action failed: ${errorMessage}'));
+  assert.ok(engine.includes('getFreezonePlayerMovementState(piece.freeSide)'));
+  assert.ok(engine.includes('resetExpiredFreezoneMoveCycle(player, now)'));
+  assert.ok(engine.includes('This piece has no legal moves right now. Check its cooldown or movement budget.'));
 });

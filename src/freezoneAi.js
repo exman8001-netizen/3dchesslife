@@ -4,9 +4,19 @@ const FREEZONE_AI_VOICE_IDS = new Set([
 const FREEZONE_SPEECH_PROVIDERS = new Set([
   'gemini-live', 'gemini-tts', 'openai-tts', 'google-tts'
 ]);
+export const FREEZONE_AI_IDLE_GRACE_MS = 20000;
 
 export function freezoneAICandidateId(pieceId, from, to, kind = 'move') {
   return JSON.stringify([pieceId, from.r, from.c, to.r, to.c, kind]);
+}
+
+export function hasFreezoneAIActions(player, now = Date.now()) {
+  const remainingActions = Number(player?.movesPerCycle || 0) - Number(player?.movesUsed || 0);
+  const remainingSteps = Number(player?.stepBudget || 0) - Number(player?.stepsUsed || 0);
+  return Number.isFinite(now) &&
+    Number(player?.cooldownUntil || 0) <= now &&
+    remainingActions > 0 &&
+    remainingSteps > 0;
 }
 
 export function shouldRequestFreezoneAIVoice(enabled, text, voiceId, provider = 'openai-tts') {

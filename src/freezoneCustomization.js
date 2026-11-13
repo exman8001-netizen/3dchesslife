@@ -1,7 +1,10 @@
 import {
-  FREEZONE_ALLY_COST,
   FREEZONE_ALLY_ROLES,
   validateFreezoneThumbnailUrl
+} from './freezoneRules.js';
+import {
+  FREEZONE_ALLY_XP_COST,
+  normalizeFreezoneWallet
 } from './freezoneRules.js';
 
 export const FREEZONE_APPEARANCES = [
@@ -113,7 +116,7 @@ export function normalizeFreezoneRoomPublication(value = {}, fallbackName = 'Fre
   };
 }
 
-export function applyFreezoneAllyPurchase(player = {}, ally) {
+export function applyFreezoneAllyPurchase(player = {}, ally, costXP = FREEZONE_ALLY_XP_COST) {
   if (!ally || typeof ally.id !== 'string' || typeof ally.pieceId !== 'string' ||
       !FREEZONE_ALLY_ROLES.includes(ally.role)) {
     return { ok: false, error: 'Choose a valid allied bot role.' };
@@ -122,19 +125,21 @@ export function applyFreezoneAllyPurchase(player = {}, ally) {
   if (allies.some((current) => current.id === ally.id || current.pieceId === ally.pieceId)) {
     return { ok: false, error: 'This allied bot has already been recruited.' };
   }
-  const botOrbs = Math.max(0, Math.floor(Number(player.orbBalances?.bot) || 0));
-  if (botOrbs < FREEZONE_ALLY_COST) {
+  const wallet = normalizeFreezoneWallet(player);
+  const price = Number.isSafeInteger(costXP) ? Math.max(0, costXP) : FREEZONE_ALLY_XP_COST;
+  if (wallet.xp < price) {
     return {
       ok: false,
-      error: `Collect ${FREEZONE_ALLY_COST - botOrbs} more bot orbs to recruit an ally.`
+      error: `You need ${price - wallet.xp} more XP to recruit an ally.`
     };
   }
   return {
     ok: true,
     player: {
       ...player,
-      orbBalances: { ...(player.orbBalances || {}), bot: botOrbs - FREEZONE_ALLY_COST },
-      allies: [...allies, { ...ally }]
+      xp: wallet.xp - price,
+      orbBalances: wallet.orbBalances,
+      allies: [...allies, { ...ally, costXP: price }]
     }
   };
 }
@@ -241,6 +246,7 @@ export function getFreezoneEliminationLeaders(pieces) {
 }
 
 export const FREEZONE_RECONNECT_GRACE_MS = 3 * 60 * 1000;
+export const FREEZONE_SEAT_ONLINE_TTL_MS = 60 * 1000;
 
 function copyFreezoneSessionState(state) {
   return {
@@ -252,6 +258,12 @@ function copyFreezoneSessionState(state) {
     eliminationRecords: Array.isArray(state.eliminationRecords)
       ? state.eliminationRecords.map((record) => ({ ...record }))
       : [],
+    ...(Array.isArray(state.orbClaims)
+      ? { orbClaims: state.orbClaims.map((claim) => ({ ...claim })) }
+      : {}),
+    ...(Array.isArray(state.eliminationRewards)
+      ? { eliminationRewards: state.eliminationRewards.map((reward) => ({ ...reward })) }
+      : {}),
     eliminatedSeats: Array.isArray(state.eliminatedSeats) ? [...state.eliminatedSeats] : []
   };
 }
@@ -262,6 +274,12 @@ function expireFreezoneSide(state, side, token) {
   delete state.freezonePlayers[side];
   delete state.freezoneDepartures[token];
   state.eliminationRecords = state.eliminationRecords.filter((record) => record.side !== side);
+  if (Array.isArray(state.orbClaims)) {
+    state.orbClaims = state.orbClaims.filter((claim) => claim.side !== side);
+  }
+  if (Array.isArray(state.eliminationRewards)) {
+    state.eliminationRewards = state.eliminationRewards.filter((reward) => reward.side !== side);
+  }
   state.eliminatedSeats = state.eliminatedSeats.filter((seat) => seat !== side);
 }
 
@@ -279,6 +297,63 @@ export function expireFreezoneSessions(state, now = Date.now(), onlineTokens = [
     }
   }
   return next;
+}
+
+export function reclaimStaleFreezoneSeatClaims(state, onlinePlayers = [], now = Date.now()) {
+  const online = new Set((Array.isArray(onlinePlayers) ? onlinePlayers : [])
+    .map((member) => typeof member === 'string' ? member : member?.token)
+    .filter((token) => typeof token === 'string'));
+  const next = copyFreezoneSessionState(state || {});
+  for (let side = 0; side < next.seats.length; side += 1) {
+    const seat = next.seats[side];
+    if (!seat?.token || seat.bot === true || online.has(seat.token)) continue;
+    const departure = next.freezoneDepartures[seat.token];
+    if (departure && departure.expiresAt > now) continue;
+    const lastSeenAt = Number(seat.lastSeenAt) || 0;
+    if (!departure && lastSeenAt > 0 &&
+        now - lastSeenAt < FREEZONE_RECONNECT_GRACE_MS) continue;
+    expireFreezoneSide(next, side, seat.token);
+  }
+  return next;
+}
+
+export function getFreezoneSeatOccupancy(state = {}, now = Date.now()) {
+  const seats = Array.isArray(state?.seats) ? state.seats : [];
+  const departures = state?.freezoneDepartures || {};
+  let online = 0;
+  let reconnecting = 0;
+  let bots = 0;
+  let staleClaims = 0;
+  for (const seat of seats) {
+    if (!seat?.token) continue;
+    if (seat.bot === true) {
+      bots += 1;
+      continue;
+    }
+    const departure = departures[seat.token];
+    const expiresAt = Number(departure?.expiresAt ?? seat.reconnectUntil) || 0;
+    if (expiresAt > now) {
+      reconnecting += 1;
+      continue;
+    }
+    const lastSeenAt = Number(seat.lastSeenAt) || 0;
+    if (!seat.offlineSince && !seat.reconnectUntil && lastSeenAt > 0 &&
+        now - lastSeenAt <= FREEZONE_SEAT_ONLINE_TTL_MS) {
+      online += 1;
+    } else if (lastSeenAt > 0 && now - lastSeenAt < FREEZONE_RECONNECT_GRACE_MS) {
+      reconnecting += 1;
+    } else {
+      staleClaims += 1;
+    }
+  }
+  return {
+    claimed: online + reconnecting + bots + staleClaims,
+    online,
+    reconnecting,
+    bots,
+    staleClaims,
+    occupied: online + reconnecting + bots
+  };
 }
 
 export function reconcileFreezonePresence(state, onlinePlayers, now = Date.now()) {
@@ -348,6 +423,102 @@ export function getFreezonePlayerLeaderboard(records, seats) {
   })).sort((left, right) =>
     right.eliminations - left.eliminations || left.side - right.side
   );
+}
+
+export function formatFreezoneSessionAge(sessionStartedAt, now = Date.now()) {
+  const startedAt = Number(sessionStartedAt) || 0;
+  if (!Number.isFinite(startedAt) || startedAt <= 0) return '0 min';
+  const elapsedMinutes = Math.max(0, Math.floor((Math.max(0, Number(now) || 0) - startedAt) / 60000));
+  const hours = Math.floor(elapsedMinutes / 60);
+  const minutes = elapsedMinutes % 60;
+  if (hours > 0) return minutes > 0 ? `${hours} h ${minutes} min` : `${hours} h`;
+  return `${elapsedMinutes} min`;
+}
+
+export function shouldUseCompactFreezoneLeaderboard(width = typeof window === 'undefined' ? 1024 : window.innerWidth) {
+  const value = Number(width);
+  return Number.isFinite(value) && value < 760;
+}
+
+export function getFreezoneRoomLeaderboard(state = {}, onlinePlayers = [], now = Date.now()) {
+  const seats = Array.isArray(state?.seats) ? state.seats : [];
+  const players = state?.freezonePlayers && typeof state.freezonePlayers === 'object'
+    ? state.freezonePlayers
+    : {};
+  const eliminationRecords = Array.isArray(state?.eliminationRecords) ? state.eliminationRecords : [];
+  const eliminationRewards = Array.isArray(state?.eliminationRewards) &&
+      state.eliminationRewards.length
+    ? state.eliminationRewards
+    : null;
+  const orbClaims = Array.isArray(state?.orbClaims) ? state.orbClaims : [];
+  const pieces = Array.isArray(state?.pieces) ? state.pieces : [];
+  const onlineTokens = new Set(
+    (Array.isArray(onlinePlayers) ? onlinePlayers : [])
+      .filter((member) => member && typeof member.token === 'string' && member.token)
+      .map((member) => member.token)
+  );
+
+  const entries = [];
+  for (let side = 0; side < seats.length; side += 1) {
+    const seat = seats[side];
+    if (!seat || (!seat.token && seat.bot !== true)) continue;
+    const isBotSeat = seat.bot === true;
+    const isOnline = isBotSeat
+      ? Boolean(state?.botsEnabled === true)
+      : Boolean(seat.token && onlineTokens.has(seat.token));
+    if (!isOnline) continue;
+    const player = players[side] || {};
+    const kills = eliminationRewards
+      ? eliminationRewards.filter((reward) =>
+        Number(reward?.side) === side && typeof reward?.id === 'string'
+      ).length
+      : eliminationRecords
+        .filter((record) => Number(record?.side) === side && Number.isSafeInteger(record?.eliminations))
+        .reduce((total, record) => total + Math.max(0, Number(record.eliminations) || 0), 0);
+    const orbsCollected = orbClaims
+      .filter((claim) => Number(claim?.side) === side && Number.isFinite(Number(claim?.amount)) && Number(claim.amount) > 0)
+      .reduce((total, claim) => total + Math.max(0, Number(claim.amount) || 0), 0);
+    const pieceCount = pieces.filter((piece) => Number(piece?.side) === side && !piece?.freezoneAllyId && !piece?.allyId).length;
+    const startedAt = Number.isSafeInteger(player?.sessionStartedAt) && player.sessionStartedAt > 0
+      ? player.sessionStartedAt
+      : Number.isSafeInteger(seat?.sessionStartedAt) && seat.sessionStartedAt > 0
+        ? seat.sessionStartedAt
+        : Number(now);
+    entries.push({
+      side,
+      name: typeof seat?.name === 'string' && seat.name.trim() ? seat.name.trim().slice(0, 32) : `Player ${side + 1}`,
+      bot: isBotSeat,
+      kills,
+      xp: Math.max(0, Math.floor(Number(player?.xp) || 0)),
+      orbsCollected,
+      pieces: pieceCount,
+      sessionStartedAt: startedAt,
+      online: true,
+      timeLabel: formatFreezoneSessionAge(startedAt, now)
+    });
+  }
+
+  entries.sort((left, right) =>
+    right.kills - left.kills ||
+    right.xp - left.xp ||
+    right.orbsCollected - left.orbsCollected ||
+    left.side - right.side
+  );
+
+  let previousScore = null;
+  let previousPosition = 0;
+  return entries.map((entry, index) => {
+    const currentScore = `${entry.kills}:${entry.xp}:${entry.orbsCollected}`;
+    const position = previousScore && previousScore === currentScore ? previousPosition : index + 1;
+    previousScore = currentScore;
+    previousPosition = position;
+    return {
+      ...entry,
+      position,
+      leader: position === 1,
+      crown: position === 1
+    };
+  });
 }
 
 export function resolveFreezoneVoice(voices, selectedVoiceURI) {
@@ -488,11 +659,33 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
   for (const [orbId, claim] of localOrbClaims) {
     if (baseOrbClaims.has(orbId)) continue;
     const currentClaim = mergedOrbClaims.get(orbId);
-    if (currentClaim && currentClaim.side !== claim.side) {
+    if (currentClaim) {
       conflictedClaims.push(claim);
       continue;
     }
-    mergedOrbClaims.set(orbId, currentClaim || claim);
+    mergedOrbClaims.set(orbId, claim);
+  }
+
+  const baseEliminationRewards = new Map(
+    (base.eliminationRewards || []).map((reward) => [reward.id, reward])
+  );
+  const localEliminationRewards = new Map(
+    (local.eliminationRewards || []).map((reward) => [reward.id, reward])
+  );
+  const mergedEliminationRewards = new Map(
+    (current.eliminationRewards || []).map((reward) => [reward.id, reward])
+  );
+  const conflictedRewards = [];
+  const rejectedRewards = [];
+  for (const [id, reward] of localEliminationRewards) {
+    if (baseEliminationRewards.has(id)) continue;
+    const currentReward = mergedEliminationRewards.get(id);
+    if (currentReward) {
+      conflictedRewards.push(reward);
+      if (currentReward.side !== reward.side) rejectedRewards.push(reward);
+      continue;
+    }
+    mergedEliminationRewards.set(id, reward);
   }
 
   const players = { ...(current.freezonePlayers || {}) };
@@ -531,34 +724,55 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
       continue;
     }
     const conflicted = conflictedClaims.filter((claim) => claim.side === Number(side));
+    const lostRewards = conflictedRewards.filter((reward) => reward.side === Number(side));
     const currentPlayer = players[side] || {};
     const allies = mergeAlliedRoster(
       basePlayer?.allies || [],
       localPlayer.allies || [],
       currentPlayer.allies || []
     );
-    if (!conflicted.length) {
-      players[side] = { ...currentPlayer, ...localPlayer, allies };
-      continue;
-    }
+    const baseAllyIds = new Set((basePlayer?.allies || []).map((ally) => ally?.id));
+    const currentAllyIds = new Set((currentPlayer.allies || []).map((ally) => ally?.id));
+    const duplicateAllyCost = (localPlayer.allies || [])
+      .filter((ally) => ally && !baseAllyIds.has(ally.id) && currentAllyIds.has(ally.id))
+      .reduce((total, ally) => total + (
+        Number.isSafeInteger(ally.costXP) && ally.costXP >= 0
+          ? ally.costXP
+          : FREEZONE_ALLY_XP_COST
+      ), 0);
+    const baseWallet = normalizeFreezoneWallet(basePlayer || {});
+    const localWallet = normalizeFreezoneWallet(localPlayer);
+    const currentWallet = normalizeFreezoneWallet(currentPlayer);
     const adjusted = {
+      ...currentPlayer,
       ...localPlayer,
-      orbBalances: { ...(localPlayer.orbBalances || {}) }
+      xp: Math.max(0, currentWallet.xp + localWallet.xp - baseWallet.xp),
+      orbBalances: Object.fromEntries(
+        Object.keys(currentWallet.orbBalances).map((type) => [
+          type,
+          Math.max(
+            0,
+            currentWallet.orbBalances[type] +
+              localWallet.orbBalances[type] - baseWallet.orbBalances[type]
+          )
+        ])
+      )
     };
+    adjusted.xp = Math.min(2_000_000_000, adjusted.xp + duplicateAllyCost);
     for (const claim of conflicted) {
       const xpAmount = Number.isFinite(claim.xpAmount)
         ? claim.xpAmount
         : claim.type === 'xp' ? claim.amount || 0 : 0;
-      if (xpAmount) {
-        adjusted.xp = Math.max(0, (adjusted.xp || 0) - xpAmount);
-        adjusted.orbBalances.xp = adjusted.xp;
-      }
+      if (xpAmount) adjusted.xp = Math.max(0, adjusted.xp - xpAmount);
       if (claim.type !== 'xp') {
         adjusted.orbBalances[claim.type] = Math.max(
           0,
           (adjusted.orbBalances[claim.type] || 0) - 1
         );
       }
+    }
+    for (const reward of lostRewards) {
+      adjusted.xp = Math.max(0, adjusted.xp - Math.max(0, Number(reward.xp) || 0));
     }
     players[side] = { ...adjusted, allies };
   }
@@ -580,6 +794,15 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
       ...record,
       eliminations: Math.max(currentRecord?.eliminations || 0, record.eliminations || 0)
     });
+  }
+  for (const reward of rejectedRewards) {
+    const record = records.get(reward.attackerPieceId);
+    if (record) {
+      records.set(reward.attackerPieceId, {
+        ...record,
+        eliminations: Math.max(0, (record.eliminations || 0) - 1)
+      });
+    }
   }
 
   const baseSeats = Array.isArray(base.seats) ? base.seats : [];
@@ -675,6 +898,7 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
     pieces: Array.from(mergedPieces.values()),
     xpOrbs,
     orbClaims: Array.from(mergedOrbClaims.values()).slice(-1024),
+    eliminationRewards: Array.from(mergedEliminationRewards.values()).slice(-1024),
     mutantZone,
     mutantZoneInitialized: Boolean(
       current.mutantZoneInitialized || local.mutantZoneInitialized
