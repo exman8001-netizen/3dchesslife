@@ -129,8 +129,10 @@ export default function App() {
   const initializedRef = useRef(false);
   const backgroundMusicRef = useRef<HTMLAudioElement>(null);
   const musicPausedByUserRef = useRef(false);
+  const sharedRadioActiveRef = useRef(false);
   const [mainMenuOpen, setMainMenuOpen] = useState(true);
   const [backgroundMusicPlaying, setBackgroundMusicPlaying] = useState(false);
+  const [sharedRadioPlaying, setSharedRadioPlaying] = useState(false);
   const [displaySettingsLoad] = useState(loadDisplayPreferences);
   const [displayPreferences, setDisplayPreferences] = useState<DisplayPreferences>(
     displaySettingsLoad.preferences
@@ -164,7 +166,7 @@ export default function App() {
 
     const tracks = mainMenuOpen
       ? introMusic ? [introMusic] : []
-      : freezoneActive ? [] : gameplayMusicPlaylist;
+      : gameplayMusicPlaylist;
     if (!tracks.length) {
       audio.pause();
       audio.removeAttribute('src');
@@ -177,6 +179,7 @@ export default function App() {
     musicPausedByUserRef.current = false;
     const updatePlaybackState = () => setBackgroundMusicPlaying(!audio.paused);
     const playCurrentTrack = () => {
+      if (!mainMenuOpen && sharedRadioActiveRef.current) return;
       audio.volume = 0.32;
       void audio.play().catch((error: unknown) => {
         if (error instanceof DOMException &&
@@ -192,7 +195,8 @@ export default function App() {
       playCurrentTrack();
     };
     const resumeAfterInteraction = () => {
-      if (audio.paused && !musicPausedByUserRef.current) playCurrentTrack();
+      if (audio.paused && !musicPausedByUserRef.current &&
+          (mainMenuOpen || !sharedRadioActiveRef.current)) playCurrentTrack();
     };
 
     audio.preload = 'auto';
@@ -217,7 +221,21 @@ export default function App() {
       audio.load();
       setBackgroundMusicPlaying(false);
     };
-  }, [mainMenuOpen, freezoneActive]);
+  }, [mainMenuOpen]);
+
+  useEffect(() => {
+    const audio = backgroundMusicRef.current;
+    if (!audio || mainMenuOpen || !freezoneActive) return;
+    if (sharedRadioPlaying) {
+      audio.pause();
+    } else if (audio.paused && !musicPausedByUserRef.current && audio.src) {
+      void audio.play().catch((error: unknown) => {
+        if (error instanceof DOMException &&
+            (error.name === 'NotAllowedError' || error.name === 'AbortError')) return;
+        console.warn('Could not resume background music.', error);
+      });
+    }
+  }, [freezoneActive, mainMenuOpen, sharedRadioPlaying]);
 
   useEffect(() => {
     try {
@@ -295,21 +313,35 @@ export default function App() {
     };
     const handleFreezoneState = (event: Event) => {
       const state = (event as CustomEvent<{ enabled?: boolean }>).detail;
-      if (typeof state?.enabled === 'boolean') setFreezoneActive(state.enabled);
+      if (typeof state?.enabled === 'boolean') {
+        setFreezoneActive(state.enabled);
+        if (!state.enabled) {
+          sharedRadioActiveRef.current = false;
+          setSharedRadioPlaying(false);
+        }
+      }
       if (state?.enabled) {
         setMainMenuOpen(false);
         setMultiplayerOpen(false);
       }
     };
+    const handleFreezoneMusic = (event: Event) => {
+      const state = (event as CustomEvent<{ url?: string; playing?: boolean }>).detail;
+      const isPlaying = Boolean(state?.url && state.playing === true);
+      sharedRadioActiveRef.current = isPlaying;
+      setSharedRadioPlaying(isPlaying);
+    };
     window.addEventListener('wizard-chess-room-state', handleRoomState);
     window.addEventListener('wizard-chess-open-multiplayer', handleInvite);
     window.addEventListener('wizard-chess-multiplayer-status', handleMultiplayerStatus);
     window.addEventListener('wizard-chess-freezone-state', handleFreezoneState);
+    window.addEventListener('wizard-chess-freezone-music', handleFreezoneMusic);
     return () => {
       window.removeEventListener('wizard-chess-room-state', handleRoomState);
       window.removeEventListener('wizard-chess-open-multiplayer', handleInvite);
       window.removeEventListener('wizard-chess-multiplayer-status', handleMultiplayerStatus);
       window.removeEventListener('wizard-chess-freezone-state', handleFreezoneState);
+      window.removeEventListener('wizard-chess-freezone-music', handleFreezoneMusic);
     };
   }, []);
 
@@ -405,6 +437,7 @@ export default function App() {
   };
 
   const toggleBackgroundMusic = () => {
+    if (freezoneActive && sharedRadioPlaying) return;
     const audio = backgroundMusicRef.current;
     if (!audio) return;
     if (audio.paused) {
@@ -425,9 +458,12 @@ export default function App() {
       type="button"
       className={className}
       onClick={toggleBackgroundMusic}
+      disabled={freezoneActive && sharedRadioPlaying}
       aria-label={backgroundMusicPlaying ? 'Pause music' : 'Play music'}
       aria-pressed={backgroundMusicPlaying}
-      title={backgroundMusicPlaying ? 'Pause music' : 'Play music'}
+      title={freezoneActive && sharedRadioPlaying
+        ? 'The shared room radio is playing'
+        : backgroundMusicPlaying ? 'Pause music' : 'Play music'}
     >
       <svg viewBox="0 0 24 24" aria-hidden="true">
         {backgroundMusicPlaying
@@ -716,6 +752,9 @@ export default function App() {
         mainMenuOpen={mainMenuOpen}
         displayPreferences={displayPreferences}
         onOpenDisplaySettings={() => setDisplaySettingsOpen(true)}
+        backgroundMusicPlaying={backgroundMusicPlaying}
+        sharedRadioPlaying={sharedRadioPlaying}
+        onToggleBackgroundMusic={toggleBackgroundMusic}
       />
 
       <div

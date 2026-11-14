@@ -260,6 +260,34 @@ export function applyFreezoneUpgradePayment(
   };
 }
 
+export function getFreezoneUpgradeNudges(current, previous, resources) {
+  if (!resources.isPlayer) return { army: false, capacity: false };
+
+  const xpIncreased = !previous || resources.xp > previous.xp;
+  const collectedOrbs = !previous || Object.entries(resources.orbBalances).some(
+    ([type, balance]) => balance > (previous.orbBalances[type] || 0)
+  );
+  const purpleOrbCollected = !previous ||
+    resources.orbBalances.purple > previous.orbBalances.purple;
+  const capacityIncreased = previous !== null &&
+    resources.capacity > previous.capacity;
+  const pieceRemoved = previous !== null && resources.pieces < previous.pieces;
+  const armyAvailable = resources.xp >= resources.pieceCost &&
+    resources.pieces < resources.capacity;
+  const capacityAvailable = resources.capacity < resources.maxCapacity &&
+    resources.canUpgradeCapacity &&
+    (resources.orbBalances.purple >= 1 || resources.xp >= resources.capacityXpCost);
+
+  return {
+    army: armyAvailable
+      ? current.army || xpIncreased || collectedOrbs || capacityIncreased || pieceRemoved
+      : false,
+    capacity: capacityAvailable
+      ? current.capacity || xpIncreased || purpleOrbCollected
+      : false
+  };
+}
+
 export function getFreezoneEliminationXP(pieceType, economy = FREEZONE_DEFAULT_ECONOMY) {
   const normalized = normalizeFreezoneEconomySettings(economy);
   return normalized.eliminationXP[pieceType] || 0;

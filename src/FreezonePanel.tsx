@@ -35,6 +35,7 @@ import {
   FREEZONE_ENVELOPE_OPTIONS,
   FREEZONE_MOVEMENT_ORB_COST,
   canUpgradeFreezoneEnvelope,
+  getFreezoneUpgradeNudges,
   getFreezoneEnvelopeUpgradeCost,
   validateFreezoneAudioFile,
   validateFreezoneAudioUrl
@@ -49,6 +50,8 @@ function getFreezoneAudioPlaybackError(error?: unknown) {
 
 type PieceType = 'pawn' | 'rook' | 'knight' | 'bishop' | 'queen';
 type MoveOffset = [number, number];
+type FreezoneMovementKind = 'drag' | 'jump' | 'teleport';
+type FreezoneQuickUpgradeNudge = 'army' | 'capacity';
 type VoiceEventKey =
   | 'entry' | 'move' | 'capture' | 'death' | 'allyDeath' | 'purchase' | 'upgrade'
   | 'inactivity' | 'inspection' | 'victory' | 'defeat' | 'vulnerable';
@@ -315,6 +318,9 @@ type FreezonePanelProps = {
   mainMenuOpen: boolean;
   displayPreferences: DisplayPreferences;
   onOpenDisplaySettings: () => void;
+  backgroundMusicPlaying: boolean;
+  sharedRadioPlaying: boolean;
+  onToggleBackgroundMusic: () => void;
 };
 
 function FreezonePieceCooldowns({
@@ -327,7 +333,8 @@ function FreezonePieceCooldowns({
   feedback,
   onUpgrade,
   onAcquire,
-  onMobility
+  onMobility,
+  onNudge
 }: {
   pieces: FreezoneTeamPiece[];
   hud: FreezoneHud;
@@ -339,6 +346,7 @@ function FreezonePieceCooldowns({
   onUpgrade: (type: Exclude<FreezoneUpgrade, 'white'>) => void;
   onAcquire: () => void;
   onMobility: () => void;
+  onNudge: (nudge: FreezoneQuickUpgradeNudge) => void;
 }) {
   const [now, setNow] = useState(Date.now);
 
@@ -394,6 +402,7 @@ function FreezonePieceCooldowns({
           onUpgrade={onUpgrade}
           onAcquire={onAcquire}
           onMobility={onMobility}
+          onNudge={onNudge}
         />
       )}
     </aside>
@@ -526,7 +535,8 @@ function FreezoneQuickUpgradeSpheres({
   feedback,
   onUpgrade,
   onAcquire,
-  onMobility
+  onMobility,
+  onNudge
 }: {
   hud: FreezoneHud;
   canAcquireArmyUnit: boolean;
@@ -537,6 +547,7 @@ function FreezoneQuickUpgradeSpheres({
   onUpgrade: (type: Exclude<FreezoneUpgrade, 'white'>) => void;
   onAcquire: () => void;
   onMobility: () => void;
+  onNudge: (nudge: FreezoneQuickUpgradeNudge) => void;
 }) {
   const skills = FREEZONE_UPGRADES.map((upgrade) => {
     const level = hud.upgradeLevels[upgrade.type];
@@ -589,6 +600,52 @@ function FreezoneQuickUpgradeSpheres({
       onClick: onMobility
     }
   ] as const;
+  const [nudges, setNudges] = useState({ army: false, capacity: false });
+  const previousResources = useRef<{
+    xp: number;
+    orbBalances: FreezoneHud['orbBalances'];
+    pieces: number;
+    capacity: number;
+  } | null>(null);
+
+  useEffect(() => {
+    const resources = {
+      isPlayer: hud.isPlayer,
+      xp: hud.xp,
+      pieceCost: hud.xpCost,
+      orbBalances: hud.orbBalances,
+      pieces: hud.pieces,
+      capacity: hud.capacity,
+      maxCapacity: hud.maxCapacity,
+      canUpgradeCapacity: hud.canUpgrade.purple,
+      capacityXpCost: upgradeXpCosts.purple
+    };
+
+    setNudges((current) =>
+      getFreezoneUpgradeNudges(current, previousResources.current, resources)
+    );
+    previousResources.current = {
+      xp: hud.xp,
+      orbBalances: { ...hud.orbBalances },
+      pieces: hud.pieces,
+      capacity: hud.capacity
+    };
+  }, [
+    hud.isPlayer,
+    hud.xp,
+    hud.xpCost,
+    hud.orbBalances,
+    hud.pieces,
+    hud.capacity,
+    hud.maxCapacity,
+    hud.canUpgrade.purple,
+    upgradeXpCosts.purple
+  ]);
+
+  const activateNudge = (nudge: FreezoneQuickUpgradeNudge) => {
+    setNudges((current) => ({ ...current, [nudge]: false }));
+    onNudge(nudge);
+  };
 
   return (
     <section className="freezone-quick-upgrades" aria-label="Freezone upgrade spheres">
@@ -620,6 +677,30 @@ function FreezoneQuickUpgradeSpheres({
         })}
       </div>
       <small className="freezone-quick-upgrade-help">Click an available sphere to unlock</small>
+      {(nudges.army || nudges.capacity) && (
+        <div className="freezone-quick-upgrade-nudges" aria-live="polite">
+          {nudges.army && (
+            <button
+              type="button"
+              className="freezone-quick-upgrade-nudge army"
+              onClick={() => activateNudge('army')}
+            >
+              <strong>New army available!</strong>
+              <span>Click here to create a piece</span>
+            </button>
+          )}
+          {nudges.capacity && (
+            <button
+              type="button"
+              className="freezone-quick-upgrade-nudge capacity"
+              onClick={() => activateNudge('capacity')}
+            >
+              <strong>New army capacity available!</strong>
+              <span>Click here to expand your army</span>
+            </button>
+          )}
+        </div>
+      )}
       {feedback && <span className="freezone-quick-upgrade-feedback" role="status">{feedback}</span>}
     </section>
   );
@@ -719,7 +800,10 @@ function movementText(
 export default function FreezonePanel({
   mainMenuOpen,
   displayPreferences,
-  onOpenDisplaySettings
+  onOpenDisplaySettings,
+  backgroundMusicPlaying,
+  sharedRadioPlaying,
+  onToggleBackgroundMusic
 }: FreezonePanelProps) {
   const [hud, setHud] = useState<FreezoneHud | null>(null);
   const [open, setOpen] = useState(false);
@@ -830,6 +914,10 @@ export default function FreezonePanel({
   const [movementKind, setMovementKind] = useState<'drag' | 'jump' | 'teleport'>('drag');
   const [movementPayment, setMovementPayment] = useState<FreezoneUpgradePayment>('orb');
   const [selectedAcquisitionPatternId, setSelectedAcquisitionPatternId] = useState('');
+  const [creationMovementKind, setCreationMovementKind] = useState<FreezoneMovementKind>('drag');
+  const [creationMovementOffsets, setCreationMovementOffsets] =
+    useState<Record<string, FreezoneMovementKind>>({});
+  const [creationSlide, setCreationSlide] = useState(false);
   const [selectedPersonalityId, setSelectedPersonalityId] = useState('');
   const [slide, setSlide] = useState(false);
   const noticeTimer = useRef<number | null>(null);
@@ -1587,7 +1675,10 @@ export default function FreezonePanel({
   useEffect(() => {
     if (!upgradeModalStage) return undefined;
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setUpgradeModalStage(null);
+      if (event.key === 'Escape') {
+        setUpgradeModalStage(null);
+        setOpen(false);
+      }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
@@ -2313,6 +2404,39 @@ export default function FreezonePanel({
   const selectedAcquisitionPattern = hud?.pieceOptions.find(
     (pattern) => pattern.id === selectedAcquisitionPatternId
   );
+  const creationMovementEntries = Object.entries(creationMovementOffsets).map(([key, kind]) => {
+    const [row, col] = key.split(',').map(Number);
+    return { row, col, kind };
+  });
+  const creationMovementCount = creationMovementEntries.length;
+
+  useEffect(() => {
+    if (!selectedAcquisitionPattern || !hud) {
+      setCreationMovementOffsets({});
+      setCreationSlide(false);
+      return;
+    }
+
+    const offsets: Record<string, FreezoneMovementKind> = {};
+    for (const [row, col] of selectedAcquisitionPattern.moves) {
+      if (Math.abs(row) > hud.envelopeRows || Math.abs(col) > hud.envelopeCols) continue;
+      const key = `${row},${col}`;
+      const kind = selectedAcquisitionPattern.teleports.some(
+        ([moveRow, moveCol]) => moveRow === row && moveCol === col
+      ) ? 'teleport' : selectedAcquisitionPattern.jumps.some(
+        ([moveRow, moveCol]) => moveRow === row && moveCol === col
+      ) ? 'jump' : 'drag';
+      offsets[key] = kind;
+    }
+    setCreationMovementOffsets(offsets);
+    setCreationSlide(selectedAcquisitionPattern.slide);
+    setCreationMovementKind('drag');
+  }, [
+    selectedAcquisitionPattern?.id,
+    hud?.envelopeRows,
+    hud?.envelopeCols
+  ]);
+
   const selectedPersonality = FREEZONE_PERSONALITIES.find(
     (personality) => personality.id === selectedPersonalityId
   );
@@ -2329,6 +2453,10 @@ export default function FreezonePanel({
   } : null;
   const defaultUpgradePayment = (type: FreezoneUpgrade): FreezoneUpgradePayment =>
     hud && hud.orbBalances[type] >= 1 ? 'orb' : 'xp';
+  const closeProgressionModal = () => {
+    setUpgradeModalStage(null);
+    setOpen(false);
+  };
   const openQuickUpgradeStage = (stage: Exclude<FreezoneUpgradeModalStage, null>) => {
     setStatus('');
     setActiveShopTab('shop');
@@ -2350,8 +2478,21 @@ export default function FreezonePanel({
       setStatus('No piece pattern is available right now.');
       return;
     }
+    if (!creationMovementEntries.length) {
+      setStatus('Choose at least one movement for your piece.');
+      return;
+    }
+    const moves: MoveOffset[] = creationMovementEntries.map(({ row, col }) => [row, col]);
     void acquirePiece({
       ...selectedAcquisitionPattern,
+      moves,
+      jumps: creationMovementEntries
+        .filter(({ kind }) => kind === 'jump')
+        .map(({ row, col }) => [row, col] as MoveOffset),
+      teleports: creationMovementEntries
+        .filter(({ kind }) => kind === 'teleport')
+        .map(({ row, col }) => [row, col] as MoveOffset),
+      slide: creationSlide,
       appearance,
       name: pieceName.trim() || selectedAcquisitionPattern.name,
       title: pieceTitle.trim() || selectedAcquisitionPattern.title,
@@ -2495,13 +2636,26 @@ export default function FreezonePanel({
             {!rankingCollapsed && (
               <div className="freezone-room-ranking-list">
                 {roomLeaderboard.length ? roomLeaderboard.map((player) => (
-                  <div
+                  <button
+                    type="button"
                     key={player.side}
-                    className={`freezone-room-ranking-row ${player.leader ? 'leader' : ''}`}
+                    className={`freezone-room-ranking-row ${player.leader ? 'leader' : ''} ${
+                      hud?.isPlayer && player.side === hud.playerSide ? 'current-player' : ''
+                    }`}
+                    aria-label={`Focus camera on ${player.name}${
+                      hud?.isPlayer && player.side === hud.playerSide ? ', you' : ''
+                    }, place ${player.position || 1}`}
+                    title={`Focus camera on ${player.name}`}
+                    onClick={() => window.dispatchEvent(new CustomEvent(
+                      'wizard-chess-freezone-focus-side',
+                      { detail: player.side }
+                    ))}
                   >
                     <span
                       className="freezone-room-ranking-position"
+                      data-side={player.side}
                       aria-label={`Place ${player.position || 1}`}
+                      title={`${player.name} team color`}
                     >
                       {player.position || 1}
                     </span>
@@ -2510,6 +2664,9 @@ export default function FreezonePanel({
                         <span className="freezone-room-ranking-name" title={player.name}>
                           {player.name}
                         </span>
+                        {hud?.isPlayer && player.side === hud.playerSide && (
+                          <span className="freezone-room-ranking-self">YOU</span>
+                        )}
                         {player.crown && (
                           <span className="freezone-room-ranking-crown" aria-label="Rank leader">♛</span>
                         )}
@@ -2532,7 +2689,7 @@ export default function FreezonePanel({
                         </span>
                       </div>
                     </div>
-                  </div>
+                  </button>
                 )) : (
                   <div className="freezone-room-empty">No players online.</div>
                 )}
@@ -2551,9 +2708,31 @@ export default function FreezonePanel({
               onUpgrade={(type) => void purchaseUpgrade(type, defaultUpgradePayment(type), true)}
               onAcquire={() => openQuickUpgradeStage('acquire-choice')}
               onMobility={() => openQuickUpgradeStage('mobility')}
+              onNudge={(nudge) => openQuickUpgradeStage(
+                nudge === 'army' ? 'acquire-choice' : 'upgrades'
+              )}
             />
           )}
           <div className="freezone-hud" aria-live="polite">
+          <button
+            type="button"
+            className="hud-btn hud-icon-button background-music-toggle freezone-background-music-toggle"
+            onClick={onToggleBackgroundMusic}
+            disabled={sharedRadioPlaying}
+            aria-label={sharedRadioPlaying
+              ? 'Shared room radio is playing'
+              : backgroundMusicPlaying ? 'Pause music' : 'Play music'}
+            aria-pressed={backgroundMusicPlaying}
+            title={sharedRadioPlaying
+              ? 'The shared room radio is playing'
+              : backgroundMusicPlaying ? 'Pause music' : 'Play music'}
+          >
+            <svg viewBox="0 0 24 24" aria-hidden="true">
+              {backgroundMusicPlaying
+                ? <path d="M7 5h4v14H7zM14 5h4v14h-4z" />
+                : <path d="M8 5.5v13L18 12 8 5.5Z" />}
+            </svg>
+          </button>
           {displayPreferences.freezoneStats && (
             <span className="freezone-hud-stats">
               XP {hud.xp} · Army {hud.pieces}/{hud.capacity} ·
@@ -4096,7 +4275,7 @@ export default function FreezonePanel({
           {hud && upgradeModalStage && (
             <div
               className="freezone-upgrade-modal-backdrop"
-              onClick={() => setUpgradeModalStage(null)}
+              onClick={closeProgressionModal}
             >
               <section
                 className="freezone-upgrade-modal"
@@ -4127,7 +4306,7 @@ export default function FreezonePanel({
                     <button
                       type="button"
                       className="freezone-upgrade-modal-close"
-                      onClick={() => setUpgradeModalStage(null)}
+                      onClick={closeProgressionModal}
                       aria-label="Close upgrades"
                     >
                       ×
@@ -4243,7 +4422,7 @@ export default function FreezonePanel({
                       <span className="freezone-acquisition-icon controlled" aria-hidden="true">♞</span>
                       <span>
                         <strong>Controllable piece</strong>
-                        <small>Create a piece for your army, then choose its movement.</small>
+                        <small>Design its movement and profile before adding it to your army.</small>
                       </span>
                       <b>{hud.xpCost} XP</b>
                     </button>
@@ -4297,9 +4476,23 @@ export default function FreezonePanel({
                 {upgradeModalStage === 'controlled-piece' && (
                   <div className="freezone-controlled-piece-form">
                     <p className="freezone-upgrade-modal-intro">
-                      Set up your piece, then create it when you are ready.
+                      Set up your piece and its starting movement, then create it when you are ready.
                     </p>
                     <div className="freezone-controlled-piece-fields">
+                      <label>
+                        Movement template
+                        <select
+                          value={selectedAcquisitionPatternId}
+                          onChange={(event) => setSelectedAcquisitionPatternId(event.target.value)}
+                          disabled={!hud.isPlayer || purchaseBusy}
+                        >
+                          {hud.pieceOptions.map((pattern) => (
+                            <option value={pattern.id} key={pattern.id}>
+                              {pattern.name} · {pattern.type}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
                       <label>
                         Name
                         <input
@@ -4336,6 +4529,95 @@ export default function FreezonePanel({
                         />
                       </label>
                     </div>
+                    <fieldset className="freezone-piece-movement-editor">
+                      <legend>Starting movement</legend>
+                      <p>
+                        Select the squares this piece can reach. Its template moves are preselected;
+                        you can change their type or add and remove offsets.
+                      </p>
+                      <div className="freezone-piece-movement-controls">
+                        <label>
+                          Movement type
+                          <select
+                            value={creationMovementKind}
+                            onChange={(event) =>
+                              setCreationMovementKind(event.target.value as FreezoneMovementKind)}
+                            disabled={!hud.isPlayer || purchaseBusy}
+                          >
+                            <option value="drag">Move / slide</option>
+                            <option value="jump">Jump</option>
+                            <option value="teleport">Teleport</option>
+                          </select>
+                        </label>
+                        <label className="freezone-piece-slide-toggle">
+                          <input
+                            type="checkbox"
+                            checked={creationSlide}
+                            onChange={(event) => setCreationSlide(event.target.checked)}
+                            disabled={!hud.isPlayer || purchaseBusy}
+                          />
+                          Slide along clear paths
+                        </label>
+                      </div>
+                      <p className="freezone-piece-movement-summary" aria-live="polite">
+                        {creationMovementCount} movement offset{creationMovementCount === 1 ? '' : 's'} selected ·
+                        {' '}{hud.envelopeRows}×{hud.envelopeCols} movement envelope
+                      </p>
+                      <div
+                        className="freezone-movement-grid freezone-piece-movement-grid"
+                        role="group"
+                        aria-label="Choose the piece's starting movement offsets"
+                        style={{
+                          gridTemplateColumns: `repeat(${hud.envelopeCols * 2 + 1}, minmax(0, 1fr))`
+                        }}
+                      >
+                        {Array.from({
+                          length: (hud.envelopeRows * 2 + 1) * (hud.envelopeCols * 2 + 1)
+                        }, (_, index) => {
+                          const rows = hud.envelopeCols * 2 + 1;
+                          const row = hud.envelopeRows - Math.floor(index / rows);
+                          const col = index % rows - hud.envelopeCols;
+                          const key = `${row},${col}`;
+                          const isCenter = row === 0 && col === 0;
+                          const selectedKind = creationMovementOffsets[key];
+                          const sameKind = selectedKind === creationMovementKind;
+                          const isStraightOrDiagonal =
+                            row === 0 || col === 0 || Math.abs(row) === Math.abs(col);
+                          const validKind = (!isCenter &&
+                            (creationMovementKind !== 'drag' || isStraightOrDiagonal)) ||
+                            (isCenter && creationMovementKind === 'teleport');
+                          const canSelect = hud.isPlayer && !purchaseBusy && validKind &&
+                            (selectedKind !== undefined || creationMovementCount < hud.maxPatternOffsets);
+
+                          return (
+                            <button
+                              key={key}
+                              type="button"
+                              className={`freezone-movement-card ${selectedKind ? 'owned' : ''} ${selectedKind || creationMovementKind}`}
+                              aria-label={`${isCenter ? 'Same-square' : `${row}, ${col}`} ${creationMovementKind} movement${selectedKind ? `; currently ${selectedKind}` : ''}`}
+                              aria-pressed={selectedKind !== undefined}
+                              title={selectedKind
+                                ? `${selectedKind} movement · click to ${sameKind ? 'remove' : `change to ${creationMovementKind}`}`
+                                : `${creationMovementKind} offset ${row}, ${col}`}
+                              disabled={!canSelect}
+                              onClick={() => setCreationMovementOffsets((current) => {
+                                const existingKind = current[key];
+                                if (existingKind === creationMovementKind) {
+                                  const next = { ...current };
+                                  delete next[key];
+                                  return next;
+                                }
+                                return { ...current, [key]: creationMovementKind };
+                              })}
+                            >
+                              {selectedKind
+                                ? sameKind ? '✓' : '↻'
+                                : isCenter ? '0,0' : '+'}
+                            </button>
+                          );
+                        })}
+                      </div>
+                    </fieldset>
                     {open && (
                       <FreezoneAppearancePreview
                         appearance={appearance}
@@ -4347,7 +4629,7 @@ export default function FreezonePanel({
                         type="button"
                         className="freezone-design-acquire"
                         disabled={!hud.isPlayer || purchaseBusy || !selectedAcquisitionPattern ||
-                          hud.xp < hud.xpCost}
+                          hud.xp < hud.xpCost || creationMovementCount === 0}
                         onClick={acquireSelectedPattern}
                       >
                         Create piece · {hud.xpCost} XP
@@ -4414,7 +4696,7 @@ export default function FreezonePanel({
                     <button
                       type="button"
                       className="freezone-design-acquire"
-                      onClick={() => setUpgradeModalStage(null)}
+                      onClick={closeProgressionModal}
                     >
                       Return to the game
                     </button>

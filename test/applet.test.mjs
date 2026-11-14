@@ -97,6 +97,7 @@ import {
   getFreezoneTerrainScaleKeys,
   getFreezoneArenaSpawnPoint,
   getFreezoneEffectiveMovementEnvelope,
+  getFreezoneUpgradeNudges,
   isValidFreezoneCell,
   freezoneCapturePhase,
   freezoneFocusPose,
@@ -317,6 +318,47 @@ test('Freezone economy separates XP from orbs and applies expected initial rewar
   const blueOrb = applyFreezoneOrbCollection(xpDust.player, 'blue', 10);
   assert.equal(blueOrb.player.xp, 20);
   assert.equal(blueOrb.player.orbBalances.blue, 1);
+});
+
+test('Freezone upgrade nudges appear at affordability and return after related orb pickups', () => {
+  const previous = {
+    xp: 90,
+    orbBalances: { purple: 0 },
+    pieces: 1,
+    capacity: 2
+  };
+  const resources = {
+    isPlayer: true,
+    xp: 100,
+    pieceCost: 100,
+    orbBalances: { purple: 0, red: 0 },
+    pieces: 1,
+    capacity: 2,
+    maxCapacity: 4,
+    canUpgradeCapacity: true,
+    capacityXpCost: 500
+  };
+  const hidden = { army: false, capacity: false };
+
+  assert.deepEqual(getFreezoneUpgradeNudges(hidden, previous, resources), {
+    army: true,
+    capacity: false
+  });
+  assert.deepEqual(getFreezoneUpgradeNudges(hidden, resources, resources), hidden);
+
+  const purplePickup = {
+    ...resources,
+    xp: 110,
+    orbBalances: { purple: 1, red: 0 }
+  };
+  assert.deepEqual(getFreezoneUpgradeNudges(hidden, resources, purplePickup), {
+    army: true,
+    capacity: true
+  });
+  assert.deepEqual(getFreezoneUpgradeNudges(hidden, resources, {
+    ...purplePickup,
+    isPlayer: false
+  }), hidden);
 });
 
 test('Freezone XP orb purchases enforce price and balance without negative currency', () => {
@@ -667,13 +709,18 @@ test('Music folder supplies the intro track and a looping gameplay playlist', ()
   assert.ok(app.includes('trackIndex = (trackIndex + 1) % tracks.length;'));
   assert.ok(app.includes("error.name === 'NotAllowedError'"));
   assert.ok(app.includes("document.addEventListener('pointerdown', resumeAfterInteraction)"));
-  assert.ok(app.includes(': freezoneActive ? [] : gameplayMusicPlaylist'));
+  assert.ok(app.includes(': gameplayMusicPlaylist'));
+  assert.ok(app.includes("window.addEventListener('wizard-chess-freezone-music', handleFreezoneMusic)"));
+  assert.ok(app.includes('if (sharedRadioPlaying) {\n      audio.pause();'));
+  assert.ok(app.includes('disabled={freezoneActive && sharedRadioPlaying}'));
   assert.ok(app.includes('aria-label={backgroundMusicPlaying ? \'Pause music\' : \'Play music\'}'));
   assert.ok(app.includes('aria-pressed={backgroundMusicPlaying}'));
   assert.ok(app.includes('musicPausedByUserRef.current = true;'));
   assert.ok(app.includes('audio.paused && !musicPausedByUserRef.current'));
   assert.ok(app.includes("renderMusicToggle('background-music-toggle menu-music-toggle')"));
-  assert.ok(app.includes("renderMusicToggle('hud-btn hud-icon-button background-music-toggle')"));
+  assert.ok(app.includes('onToggleBackgroundMusic={toggleBackgroundMusic}'));
+  const freezonePanel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  assert.ok(freezonePanel.includes('freezone-background-music-toggle'));
   assert.ok(styles.includes('.background-music-toggle svg'));
   assert.ok(styles.includes('.background-music-toggle:focus-visible'));
 });
@@ -771,8 +818,15 @@ test('Freezone rank and Arena modal use the medieval gold treatment without repl
   assert.ok(panel.includes('formatFreezoneRankingNumber(player.orbsCollected)'));
   assert.ok(panel.includes('formatFreezoneRankingNumber(player.pieces)'));
   assert.ok(panel.includes('player.timeLabel || formatFreezoneSessionAge'));
+  assert.match(panel, /<button\s+type="button"\s+key=\{player\.side\}/);
+  assert.ok(panel.includes("'wizard-chess-freezone-focus-side'"));
+  assert.ok(panel.includes('data-side={player.side}'));
+  assert.ok(panel.includes('className="freezone-room-ranking-self">YOU</span>'));
   assert.ok(styles.includes('.freezone-room-ranking::before'));
   assert.ok(styles.includes('.freezone-room-ranking-position'));
+  assert.ok(styles.includes('.freezone-room-ranking-position[data-side="5"]'));
+  assert.ok(styles.includes('.freezone-room-ranking-row:focus-visible'));
+  assert.ok(styles.includes('.freezone-room-ranking-row.current-player'));
   assert.ok(styles.includes('.freezone-room-ranking-metric.orbs > span'));
   assert.ok(styles.includes('.freezone-dialog::before'));
   assert.ok(styles.includes('@media (max-width: 768px)'));
@@ -2268,6 +2322,32 @@ test('Freezone camera keeps a comfortable distance when re-framing a moved piece
   assert.ok(pose.position.every(Number.isFinite));
 });
 
+test('Freezone entry and ranking camera focus frames the avatar close enough to identify', () => {
+  const pose = freezoneFocusPose([0, 5, 10], [0, 0, 0], [3, 0.5, -2], 4.8);
+  const distance = Math.hypot(
+    pose.position[0] - pose.target[0],
+    pose.position[1] - pose.target[1],
+    pose.position[2] - pose.target[2]
+  );
+  assert.ok(distance < 7.2);
+  assert.ok(distance >= 4.8);
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  assert.ok(engine.includes('function focusFreezonePiece(piece, distance = 4.8)'));
+  assert.ok(engine.includes('piece.mesh.getWorldPosition(new THREE.Vector3())'));
+});
+
+test('Freezone armies are positioned in the wide arena instead of standard chessboard coordinates', () => {
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const instantiateStart = engine.indexOf('function instantiatePiece(');
+  const instantiateEnd = engine.indexOf('function syncFreezonePiece(', instantiateStart);
+  const instantiatePiece = engine.slice(instantiateStart, instantiateEnd);
+
+  assert.match(
+    instantiatePiece,
+    /customGameConfig\?\.gameMode === 'freezone'\s*\? freeBoardToWorld\(r, c\)\s*:\s*boardToWorld\(r, c\)/
+  );
+});
+
 test('Freezone room leaderboard includes only online players, keeps tied leaders together and counts zeroed stats', () => {
   const now = 1_700_000_000_000;
   const state = {
@@ -2398,24 +2478,39 @@ test('Freezone shop stays open through repeated HUD updates', () => {
   assert.ok(styles.includes('.freezone-piece-cooldowns'));
 });
 
-test('Freezone quick spheres guide a new army through identity and celebration without a movement editor', () => {
+test('Freezone quick spheres show resource nudges and create pieces with chosen movement', () => {
   const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
   const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
   const acquisitionStart = panel.indexOf('const acquirePiece = async');
   const acquisitionEnd = panel.indexOf('const emitTeamVoiceEvent =', acquisitionStart);
   const acquisition = panel.slice(acquisitionStart, acquisitionEnd);
+  const closeStart = panel.indexOf('const closeProgressionModal =');
+  const closeEnd = panel.indexOf('const openQuickUpgradeStage =', closeStart);
+  const closeModal = panel.slice(closeStart, closeEnd);
 
   assert.ok(panel.includes('aria-label="Freezone upgrade spheres"'));
   assert.ok(panel.includes("onClick={() => setUpgradeModalStage('army-unlocked')}"));
   assert.ok(panel.includes('Victory phrase'));
+  assert.ok(panel.includes('Movement template'));
+  assert.ok(panel.includes("Choose the piece's starting movement offsets"));
+  assert.ok(panel.includes('creationMovementEntries.map(({ row, col }) => [row, col])'));
+  assert.ok(panel.includes("option value=\"teleport\">Teleport</option>"));
   assert.ok(panel.includes('onClick={acquireSelectedPattern}'));
   assert.ok(panel.includes('Create piece · {hud.xpCost} XP'));
   assert.ok(panel.includes("upgradeModalStage === 'army-replacement'"));
-  assert.ok(!panel.includes('piece-movement'));
+  assert.ok(panel.includes('New army available!'));
+  assert.ok(panel.includes('New army capacity available!'));
+  assert.ok(panel.includes('getFreezoneUpgradeNudges'));
+  assert.ok(panel.includes('onNudge={(nudge) => openQuickUpgradeStage('));
+  assert.ok(closeModal.includes('setUpgradeModalStage(null)'));
+  assert.ok(closeModal.includes('setOpen(false)'));
+  assert.ok(panel.includes('onClick={closeProgressionModal}'));
   assert.ok(acquisition.indexOf("setUpgradeModalStage('army-celebration')") >
     acquisition.indexOf('if (result.ok)'));
   assert.ok(panel.includes('freezone-army-confetti'));
   assert.ok(styles.includes('.freezone-quick-upgrade-grid'));
+  assert.ok(styles.includes('.freezone-quick-upgrade-nudge'));
+  assert.ok(styles.includes('.freezone-piece-movement-editor'));
   assert.ok(styles.includes('@keyframes freezone-army-confetti-fall'));
 });
 
@@ -2450,6 +2545,10 @@ test('Freezone selection persists for repeat moves and entry camera focuses the 
   const focusEnd = engine.indexOf('function advanceCustomTurn()', focusStart);
   const focusOnEntry = engine.slice(focusStart, focusEnd);
   assert.ok(focusOnEntry.includes('focusFreezonePiece(piece);'));
+  assert.ok(focusOnEntry.includes('getFreezoneFocusPieceForSide(side)'));
+  assert.ok(engine.includes('function focusFreezonePiece(piece, distance = 4.8)'));
+  assert.ok(engine.includes("window.addEventListener('wizard-chess-freezone-focus-side'"));
+  assert.ok(engine.includes('focusFreezonePiece(piece);'));
   assert.ok(engine.includes('focusFreezoneTeamOnEntry();'));
   assert.ok(engine.includes('You are not assigned to a player seat in this room.'));
   assert.ok(engine.includes('That square is not a legal destination; a piece, block, or movement rule prevents it.'));

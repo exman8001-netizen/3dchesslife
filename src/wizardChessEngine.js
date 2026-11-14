@@ -1841,7 +1841,9 @@ export function initWizardChess() {
       }
 
       if (appearance) addFreezoneAppearance(root, appearance, primaryMat, goldTrimMat);
-      const worldPos = boardToWorld(r, c);
+      const worldPos = customGameConfig?.gameMode === 'freezone'
+        ? freeBoardToWorld(r, c)
+        : boardToWorld(r, c);
       root.position.copy(worldPos);
       const scale = BOARD_SQ_SIZE;
       root.scale.set(scale, scale, scale);
@@ -8172,16 +8174,16 @@ export function initWizardChess() {
       }, FREEZONE_AI_IDLE_GRACE_MS);
     }
 
-    function focusFreezonePiece(piece) {
+    function focusFreezonePiece(piece, distance = 4.8) {
       if (customGameConfig?.gameMode !== 'freezone' || !piece) return;
-      const target = freeBoardToWorld(piece.r, piece.c);
-      target.y += 0.45;
+      const target = piece.mesh.getWorldPosition(new THREE.Vector3());
+      target.y += 0.55;
       const startTarget = orbitControls.target.clone();
       const pose = freezoneFocusPose(
         camera.position.toArray(),
         startTarget.toArray(),
         target.toArray(),
-        9.5,
+        distance,
         normalizeFreezoneArenaFormat(customGameConfig.arenaFormat)
       );
       const endPos = new THREE.Vector3(...pose.position);
@@ -8195,14 +8197,25 @@ export function initWizardChess() {
       };
     }
 
+    function getFreezoneFocusPieceForSide(side) {
+      const sidePieces = Array.from(freePieces.values())
+        .filter((piece) => piece.freeSide === side);
+      if (!sidePieces.length) return null;
+      const controlledPieceId = freezonePlayerState.get(side)?.controlledPieceId ||
+        (side === customPlayerIndex ? selectedFreePieceId : '');
+      return sidePieces.find((piece) => piece.type === 'king' && !piece.freezoneAllyId) ||
+        sidePieces.find((piece) => piece.freeId === controlledPieceId) ||
+        sidePieces.find((piece) => !piece.freezoneAllyId) ||
+        sidePieces[0];
+    }
+
     function focusFreezoneTeamOnEntry() {
       if (customGameConfig?.gameMode !== 'freezone') return;
       const side = gameMode === 'multi' ? customPlayerIndex : 0;
       if (side < 0) return;
       const focusKey = `${roomCode || 'local'}:${side}`;
       if (freezoneCameraFocusKey === focusKey) return;
-      const piece = Array.from(freePieces.values())
-        .find((candidate) => candidate.freeSide === side);
+      const piece = getFreezoneFocusPieceForSide(side);
       if (!piece) return;
       focusFreezonePiece(piece);
       freezoneCameraFocusKey = focusKey;
@@ -9864,6 +9877,14 @@ export function initWizardChess() {
 
     document.getElementById('btn-ai-move')?.addEventListener('click', () => {
       triggerAIMoveNow();
+    });
+
+    window.addEventListener('wizard-chess-freezone-focus-side', (event) => {
+      if (customGameConfig?.gameMode !== 'freezone') return;
+      const side = Number(event.detail);
+      if (!Number.isInteger(side) || side < 0 || side >= customSeats.length) return;
+      const piece = getFreezoneFocusPieceForSide(side);
+      if (piece) focusFreezonePiece(piece);
     });
 
     document.querySelectorAll('.free-mode-toggle').forEach((button) => {
