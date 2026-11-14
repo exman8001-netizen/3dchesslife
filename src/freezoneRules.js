@@ -209,6 +209,57 @@ export function applyFreezoneOrbPurchase(player = {}, type, economy = {}) {
   };
 }
 
+export function applyFreezoneUpgradePayment(
+  player = {},
+  type,
+  orbAmount,
+  xpCost,
+  payment = 'orb'
+) {
+  if (!FREEZONE_ORB_TYPES.includes(type) || type === 'xp' ||
+      !Number.isSafeInteger(orbAmount) || orbAmount < 1 ||
+      !Number.isSafeInteger(xpCost) || xpCost < 0 ||
+      (payment !== 'orb' && payment !== 'xp')) {
+    return { ok: false, error: 'Choose a valid upgrade payment.' };
+  }
+  const wallet = normalizeFreezoneWallet(player);
+  if (payment === 'xp') {
+    if (wallet.xp < xpCost) {
+      return { ok: false, error: `You need ${xpCost - wallet.xp} more XP to upgrade.` };
+    }
+    return {
+      ok: true,
+      payment,
+      cost: xpCost,
+      player: {
+        ...player,
+        xp: wallet.xp - xpCost,
+        orbBalances: wallet.orbBalances
+      }
+    };
+  }
+  if (wallet.orbBalances[type] < orbAmount) {
+    const missing = orbAmount - wallet.orbBalances[type];
+    return {
+      ok: false,
+      error: `Collect ${missing} more ${type} orb${missing === 1 ? '' : 's'} first.`
+    };
+  }
+  return {
+    ok: true,
+    payment,
+    cost: orbAmount,
+    player: {
+      ...player,
+      xp: wallet.xp,
+      orbBalances: {
+        ...wallet.orbBalances,
+        [type]: wallet.orbBalances[type] - orbAmount
+      }
+    }
+  };
+}
+
 export function getFreezoneEliminationXP(pieceType, economy = FREEZONE_DEFAULT_ECONOMY) {
   const normalized = normalizeFreezoneEconomySettings(economy);
   return normalized.eliminationXP[pieceType] || 0;

@@ -63,9 +63,15 @@ async function requestTextModel(
   apiKey: string,
   model: string,
   systemPrompt: string,
-  userPrompt: string
+  userPrompt: string,
+  timeoutMs = 15_000
 ) {
-  const requestOpenRouter = (requestedModel: string) => fetch(
+  const fetchWithTimeout = (url: string, init: RequestInit) => {
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    return fetch(url, { ...init, signal: controller.signal }).finally(() => clearTimeout(timeoutId));
+  };
+  const requestOpenRouter = (requestedModel: string) => fetchWithTimeout(
     'https://openrouter.ai/api/v1/chat/completions',
     {
       method: 'POST',
@@ -88,7 +94,7 @@ async function requestTextModel(
   );
   let response: Response;
   if (provider === 'gemini') {
-    response = await fetch(
+    response = await fetchWithTimeout(
       `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`,
       {
         method: 'POST',
@@ -118,7 +124,7 @@ async function requestTextModel(
     const endpoint = provider === 'openai'
       ? 'https://api.openai.com/v1/chat/completions'
       : 'https://api.deepseek.com/chat/completions';
-    response = await fetch(endpoint, {
+    response = await fetchWithTimeout(endpoint, {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${apiKey}`,
@@ -414,7 +420,8 @@ Deno.serve(async (request) => {
             dialogueApiKey,
             dialogueModel,
             dialogueSystemPrompt,
-            dialoguePrompt
+            dialoguePrompt,
+            5_000
           ) as { lines?: unknown };
           rawLines = Array.isArray(dialogue.lines) ? dialogue.lines : [];
         } catch (error) {

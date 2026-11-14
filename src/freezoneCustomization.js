@@ -36,6 +36,8 @@ export const FREEZONE_VOICE_EVENTS = [
 ];
 
 export const FREEZONE_MAX_BOTS = 2;
+export const FREEZONE_BOT_MOVE_DELAY_MIN_MS = 6000;
+export const FREEZONE_BOT_MOVE_DELAY_MAX_MS = 9000;
 export const FREEZONE_ROOM_CONFIG_VERSION = 1;
 export const FREEZONE_ROOM_THEME_DEFAULTS = {
   surface: '#dcd3c2',
@@ -58,6 +60,16 @@ export const FREEZONE_ROOM_TAGS = [
   'beginner',
   'competitive'
 ];
+
+export function getFreezoneBotMoveDelay(random = Math.random) {
+  const sample = Number(random());
+  const normalized = Number.isFinite(sample)
+    ? Math.max(0, Math.min(0.999999999, sample))
+    : 0;
+  return FREEZONE_BOT_MOVE_DELAY_MIN_MS + Math.floor(
+    normalized * (FREEZONE_BOT_MOVE_DELAY_MAX_MS - FREEZONE_BOT_MOVE_DELAY_MIN_MS + 1)
+  );
+}
 
 /** @returns {'square' | 'triangle' | 'hexagonal'} */
 export function normalizeFreezoneArenaFormat(value) {
@@ -162,10 +174,92 @@ export const FREEZONE_AI_VOICES = [
   { id: 'sage', label: 'Sage' },
   { id: 'shimmer', label: 'Shimmer' }
 ];
+export const FREEZONE_QWEN_VOICES = [
+  { id: 'Cherry', label: 'Cherry · friendly' },
+  { id: 'Serena', label: 'Serena · gentle' },
+  { id: 'Ethan', label: 'Ethan · energetic' },
+  { id: 'Chelsie', label: 'Chelsie · character' },
+  { id: 'Momo', label: 'Momo · playful' },
+  { id: 'Vivian', label: 'Vivian · confident' },
+  { id: 'Moon', label: 'Moon · bold' },
+  { id: 'Maia', label: 'Maia · thoughtful' },
+  { id: 'Kai', label: 'Kai · soothing' },
+  { id: 'Bella', label: 'Bella · bubbly' },
+  { id: 'Jennifer', label: 'Jennifer · cinematic' },
+  { id: 'Ryan', label: 'Ryan · dramatic' },
+  { id: 'Katerina', label: 'Katerina · mature' },
+  { id: 'Aiden', label: 'Aiden · youthful' },
+  { id: 'Eldric Sage', label: 'Eldric Sage · wise' },
+  { id: 'Mia', label: 'Mia · gentle' },
+  { id: 'Mochi', label: 'Mochi · lively' },
+  { id: 'Bellona', label: 'Bellona · heroic' },
+  { id: 'Vincent', label: 'Vincent · raspy' },
+  { id: 'Bunny', label: 'Bunny · cute' },
+  { id: 'Neil', label: 'Neil · clear' },
+  { id: 'Elias', label: 'Elias · storyteller' },
+  { id: 'Arthur', label: 'Arthur · earthy' },
+  { id: 'Nini', label: 'Nini · soft' },
+  { id: 'Seren', label: 'Seren · soothing' },
+  { id: 'Pip', label: 'Pip · mischievous' },
+  { id: 'Stella', label: 'Stella · spirited' },
+  { id: 'Bodega', label: 'Bodega · Spanish male' },
+  { id: 'Sonrisa', label: 'Sonrisa · Latin American female' },
+  { id: 'Alek', label: 'Alek · distinctive' },
+  { id: 'Dolce', label: 'Dolce · relaxed' },
+  { id: 'Sohee', label: 'Sohee · expressive' },
+  { id: 'Ono Anna', label: 'Ono Anna · spirited' },
+  { id: 'Lenn', label: 'Lenn · rebellious' },
+  { id: 'Emilien', label: 'Emilien · romantic' },
+  { id: 'Andre', label: 'Andre · steady' },
+  { id: 'Radio Gol', label: 'Radio Gol · commentator' }
+];
+export const FREEZONE_KOKORO_VOICES = [
+  { id: 'af_heart', label: 'Heart · American English · female' },
+  { id: 'af_alloy', label: 'Alloy · American English · female' },
+  { id: 'af_aoede', label: 'Aoede · American English · female' },
+  { id: 'af_bella', label: 'Bella · American English · female' },
+  { id: 'af_jessica', label: 'Jessica · American English · female' },
+  { id: 'af_kore', label: 'Kore · American English · female' },
+  { id: 'af_nicole', label: 'Nicole · American English · female' },
+  { id: 'af_nova', label: 'Nova · American English · female' },
+  { id: 'af_river', label: 'River · American English · female' },
+  { id: 'af_sarah', label: 'Sarah · American English · female' },
+  { id: 'af_sky', label: 'Sky · American English · female' },
+  { id: 'am_adam', label: 'Adam · American English · male' },
+  { id: 'am_echo', label: 'Echo · American English · male' },
+  { id: 'am_eric', label: 'Eric · American English · male' },
+  { id: 'am_fenrir', label: 'Fenrir · American English · male' },
+  { id: 'am_liam', label: 'Liam · American English · male' },
+  { id: 'am_michael', label: 'Michael · American English · male' },
+  { id: 'am_onyx', label: 'Onyx · American English · male' },
+  { id: 'am_puck', label: 'Puck · American English · male' },
+  { id: 'am_santa', label: 'Santa · American English · male' },
+  { id: 'bf_alice', label: 'Alice · British English · female' },
+  { id: 'bf_emma', label: 'Emma · British English · female' },
+  { id: 'bf_isabella', label: 'Isabella · British English · female' },
+  { id: 'bf_lily', label: 'Lily · British English · female' },
+  { id: 'bm_daniel', label: 'Daniel · British English · male' },
+  { id: 'bm_fable', label: 'Fable · British English · male' },
+  { id: 'bm_george', label: 'George · British English · male' },
+  { id: 'bm_lewis', label: 'Lewis · British English · male' },
+  { id: 'ef_dora', label: 'Dora · Spanish · female' },
+  { id: 'em_alex', label: 'Alex · Spanish · male' },
+  { id: 'em_santa', label: 'Santa · Spanish · male' },
+  { id: 'pf_dora', label: 'Dora · Brazilian Portuguese · female' },
+  { id: 'pm_alex', label: 'Alex · Brazilian Portuguese · male' },
+  { id: 'pm_santa', label: 'Santa · Brazilian Portuguese · male' }
+];
+export const FREEZONE_KOKORO_BROWSER_VOICE_IDS = new Set(
+  FREEZONE_KOKORO_VOICES
+    .filter(({ id }) => id.startsWith('a') || id.startsWith('b'))
+    .map(({ id }) => id)
+);
 
 const appearanceIds = new Set(FREEZONE_APPEARANCES.map(({ id }) => id));
 const aiLanguageIds = new Set(FREEZONE_AI_LANGUAGES.map(({ id }) => id));
 const aiVoiceIds = new Set(FREEZONE_AI_VOICES.map(({ id }) => id));
+const qwenVoiceIds = new Set(FREEZONE_QWEN_VOICES.map(({ id }) => id));
+const kokoroVoiceIds = new Set(FREEZONE_KOKORO_VOICES.map(({ id }) => id));
 
 export function sanitizeFreezoneProfile(profile = {}) {
   const voiceLines = {};
@@ -186,11 +280,101 @@ export function sanitizeFreezoneProfile(profile = {}) {
       : '',
     language: aiLanguageIds.has(profile.language) ? profile.language : 'en-US',
     aiVoice: aiVoiceIds.has(profile.aiVoice) ? profile.aiVoice : 'alloy',
+    qwenVoice: qwenVoiceIds.has(profile.qwenVoice) ? profile.qwenVoice : '',
+    kokoroVoice: kokoroVoiceIds.has(profile.kokoroVoice) ? profile.kokoroVoice : '',
     catchphrase: typeof profile.catchphrase === 'string'
       ? profile.catchphrase.trim().slice(0, 120)
       : '',
     voiceLines
   };
+}
+
+function compareFreezoneUpdatedRecords(left, right) {
+  const leftTime = Number.isSafeInteger(left?.updatedAt) ? left.updatedAt : 0;
+  const rightTime = Number.isSafeInteger(right?.updatedAt) ? right.updatedAt : 0;
+  if (leftTime !== rightTime) return leftTime - rightTime;
+  const leftStatus = left?.status === 'pending' ? 0 : 1;
+  const rightStatus = right?.status === 'pending' ? 0 : 1;
+  if (leftStatus !== rightStatus) return leftStatus - rightStatus;
+  return JSON.stringify(left).localeCompare(JSON.stringify(right));
+}
+
+export function normalizeFreezoneRelations(relations) {
+  if (!Array.isArray(relations)) return [];
+  const normalized = new Map();
+  for (const relation of relations) {
+    if (!relation || !Number.isInteger(relation.sideA) ||
+        !Number.isInteger(relation.sideB) || relation.sideA < 0 ||
+        relation.sideB < 0 || relation.sideA >= 10 || relation.sideB >= 10 ||
+        relation.sideA === relation.sideB ||
+        !['ally', 'enemy', 'neutral'].includes(relation.status)) continue;
+    const sideA = Math.min(relation.sideA, relation.sideB);
+    const sideB = Math.max(relation.sideA, relation.sideB);
+    const next = {
+      id: `${sideA}:${sideB}`,
+      sideA,
+      sideB,
+      status: relation.status,
+      updatedAt: Number.isSafeInteger(relation.updatedAt) && relation.updatedAt >= 0
+        ? relation.updatedAt
+        : 0,
+      updatedBy: Number.isInteger(relation.updatedBy) &&
+          (relation.updatedBy === sideA || relation.updatedBy === sideB)
+        ? relation.updatedBy
+        : sideA
+    };
+    const previous = normalized.get(next.id);
+    if (!previous || compareFreezoneUpdatedRecords(next, previous) > 0) {
+      normalized.set(next.id, next);
+    }
+  }
+  return Array.from(normalized.values()).sort((left, right) =>
+    left.sideA - right.sideA || left.sideB - right.sideB
+  );
+}
+
+export function normalizeFreezoneAllianceInvitations(invitations) {
+  if (!Array.isArray(invitations)) return [];
+  const normalized = new Map();
+  for (const invitation of invitations) {
+    if (!invitation || typeof invitation.id !== 'string' ||
+        invitation.id.length < 1 || invitation.id.length > 160 ||
+        !Number.isInteger(invitation.fromSide) || !Number.isInteger(invitation.toSide) ||
+        invitation.fromSide < 0 || invitation.toSide < 0 ||
+        invitation.fromSide >= 10 || invitation.toSide >= 10 ||
+        invitation.fromSide === invitation.toSide ||
+        !['pending', 'accepted', 'declined', 'cancelled'].includes(invitation.status)) continue;
+    const next = {
+      id: invitation.id,
+      fromSide: invitation.fromSide,
+      toSide: invitation.toSide,
+      status: invitation.status,
+      createdAt: Number.isSafeInteger(invitation.createdAt) && invitation.createdAt >= 0
+        ? invitation.createdAt
+        : 0,
+      updatedAt: Number.isSafeInteger(invitation.updatedAt) && invitation.updatedAt >= 0
+        ? invitation.updatedAt
+        : Number.isSafeInteger(invitation.createdAt) ? invitation.createdAt : 0
+    };
+    const previous = normalized.get(next.id);
+    if (!previous || compareFreezoneUpdatedRecords(next, previous) > 0) {
+      normalized.set(next.id, next);
+    }
+  }
+  const latestByPair = new Map();
+  for (const invitation of normalized.values()) {
+    const key = `${Math.min(invitation.fromSide, invitation.toSide)}:` +
+      `${Math.max(invitation.fromSide, invitation.toSide)}`;
+    const previous = latestByPair.get(key);
+    if (!previous || compareFreezoneUpdatedRecords(invitation, previous) > 0) {
+      latestByPair.set(key, invitation);
+    }
+  }
+  return Array.from(latestByPair.values())
+    .sort((left, right) =>
+      left.createdAt - right.createdAt || left.id.localeCompare(right.id)
+    )
+    .slice(-1024);
 }
 
 export function sanitizeFreezoneAIDialogue(dialogue) {
@@ -204,7 +388,8 @@ export function sanitizeFreezoneAIDialogue(dialogue) {
       typeof line.text === 'string')
     .map((line) => ({
       pieceId: line.pieceId.slice(0, 256),
-      text: line.text.trim().replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120)
+      text: line.text.trim().replace(/[\u0000-\u001f\u007f]/g, ' ').slice(0, 120),
+      ...(aiLanguageIds.has(line.language) ? { language: line.language } : {})
     }))
     .filter((line) => line.text.length > 0);
   return lines.length ? { id: dialogue.id, createdAt: dialogue.createdAt, lines } : null;
@@ -258,6 +443,10 @@ function copyFreezoneSessionState(state) {
     eliminationRecords: Array.isArray(state.eliminationRecords)
       ? state.eliminationRecords.map((record) => ({ ...record }))
       : [],
+    freezoneRelations: normalizeFreezoneRelations(state.freezoneRelations),
+    freezoneAllianceInvitations: normalizeFreezoneAllianceInvitations(
+      state.freezoneAllianceInvitations
+    ),
     ...(Array.isArray(state.orbClaims)
       ? { orbClaims: state.orbClaims.map((claim) => ({ ...claim })) }
       : {}),
@@ -274,6 +463,12 @@ function expireFreezoneSide(state, side, token) {
   delete state.freezonePlayers[side];
   delete state.freezoneDepartures[token];
   state.eliminationRecords = state.eliminationRecords.filter((record) => record.side !== side);
+  state.freezoneRelations = state.freezoneRelations.filter((relation) =>
+    relation.sideA !== side && relation.sideB !== side
+  );
+  state.freezoneAllianceInvitations = state.freezoneAllianceInvitations.filter((invitation) =>
+    invitation.fromSide !== side && invitation.toSide !== side
+  );
   if (Array.isArray(state.orbClaims)) {
     state.orbClaims = state.orbClaims.filter((claim) => claim.side !== side);
   }
@@ -362,13 +557,23 @@ export function reconcileFreezonePresence(state, onlinePlayers, now = Date.now()
     members.filter((member) => member && typeof member.token === 'string')
       .map((member) => [member.token, member])
   );
-  const next = expireFreezoneSessions(state, now, onlineByToken.keys());
+  let next = expireFreezoneSessions(state, now, onlineByToken.keys());
+  if (next.botsEnabled !== true && next.seats.some((seat) => seat?.bot === true)) {
+    next = configureFreezoneBots(next, false).state;
+  }
+  const activeSides = new Set();
   for (let side = 0; side < next.seats.length; side += 1) {
     const seat = next.seats[side];
-    if (!seat?.token || seat.bot === true) continue;
+    if (!seat) continue;
+    if (seat.bot === true) {
+      if (next.botsEnabled === true) activeSides.add(side);
+      continue;
+    }
+    if (!seat.token) continue;
     const member = onlineByToken.get(seat.token);
     const departure = next.freezoneDepartures[seat.token];
     if (member) {
+      activeSides.add(side);
       if (departure && departure.expiresAt > now) {
         const existingIds = new Set(next.pieces.map((piece) => piece.id));
         next.pieces.push(...departure.pieces.filter((piece) => !existingIds.has(piece.id)));
@@ -402,6 +607,7 @@ export function reconcileFreezonePresence(state, onlinePlayers, now = Date.now()
       reconnectUntil: expiresAt
     };
   }
+  next.pieces = next.pieces.filter((piece) => activeSides.has(piece.side));
   return next;
 }
 
@@ -568,6 +774,13 @@ export function configureFreezoneBots(state, enabled, roomCode = '') {
     );
     next.eliminatedSeats = next.eliminatedSeats.filter((side) => !removed.has(side));
     next.orbClaims = next.orbClaims.filter((claim) => !removed.has(claim.side));
+    next.freezoneRelations = normalizeFreezoneRelations(next.freezoneRelations)
+      .filter((relation) => !removed.has(relation.sideA) && !removed.has(relation.sideB));
+    next.freezoneAllianceInvitations = normalizeFreezoneAllianceInvitations(
+      next.freezoneAllianceInvitations
+    ).filter((invitation) =>
+      !removed.has(invitation.fromSide) && !removed.has(invitation.toSide)
+    );
     if (Array.isArray(next.movedPieceIds)) {
       next.movedPieceIds = next.movedPieceIds.filter((id) => !removedPieceIds.has(id));
     }
@@ -595,6 +808,13 @@ export function configureFreezoneBots(state, enabled, roomCode = '') {
     );
     next.eliminatedSeats = next.eliminatedSeats.filter((side) => !removed.has(side));
     next.orbClaims = next.orbClaims.filter((claim) => !removed.has(claim.side));
+    next.freezoneRelations = normalizeFreezoneRelations(next.freezoneRelations)
+      .filter((relation) => !removed.has(relation.sideA) && !removed.has(relation.sideB));
+    next.freezoneAllianceInvitations = normalizeFreezoneAllianceInvitations(
+      next.freezoneAllianceInvitations
+    ).filter((invitation) =>
+      !removed.has(invitation.fromSide) && !removed.has(invitation.toSide)
+    );
     if (Array.isArray(next.movedPieceIds)) {
       next.movedPieceIds = next.movedPieceIds.filter((id) => !removedPieceIds.has(id));
     }
@@ -880,6 +1100,39 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
   const aiHistory = Array.from(historyById.values())
     .sort((left, right) => left.createdAt - right.createdAt)
     .slice(-32);
+  const mergeRoomRecords = (baseRecords, localRecords, currentRecords, normalize, keyOf) => {
+    const baseById = new Map(normalize(baseRecords).map((record) => [keyOf(record), record]));
+    const localById = new Map(normalize(localRecords).map((record) => [keyOf(record), record]));
+    const mergedById = new Map(normalize(currentRecords).map((record) => [keyOf(record), record]));
+    for (const id of new Set([...baseById.keys(), ...localById.keys()])) {
+      const baseRecord = baseById.get(id);
+      const localRecord = localById.get(id);
+      if (JSON.stringify(baseRecord) === JSON.stringify(localRecord)) continue;
+      const currentRecord = mergedById.get(id);
+      if (!localRecord) {
+        if (JSON.stringify(currentRecord) === JSON.stringify(baseRecord)) mergedById.delete(id);
+        continue;
+      }
+      if (!currentRecord || compareFreezoneUpdatedRecords(localRecord, currentRecord) > 0) {
+        mergedById.set(id, localRecord);
+      }
+    }
+    return normalize(Array.from(mergedById.values()));
+  };
+  const freezoneRelations = mergeRoomRecords(
+    base.freezoneRelations,
+    local.freezoneRelations,
+    current.freezoneRelations,
+    normalizeFreezoneRelations,
+    (relation) => relation.id
+  );
+  const freezoneAllianceInvitations = mergeRoomRecords(
+    base.freezoneAllianceInvitations,
+    local.freezoneAllianceInvitations,
+    current.freezoneAllianceInvitations,
+    normalizeFreezoneAllianceInvitations,
+    (invitation) => invitation.id
+  );
   const roomConfig = current.config ?? local.config ?? base.config;
 
   return {
@@ -892,6 +1145,8 @@ export function mergeFreezoneRoomState(baseState, localState, currentState) {
     seats: mergedSeats,
     freezonePlayers: players,
     freezoneDepartures: departures,
+    freezoneRelations,
+    freezoneAllianceInvitations,
     botsEnabled: current.botsEnabled === base.botsEnabled
       ? Boolean(local.botsEnabled)
       : Boolean(current.botsEnabled),

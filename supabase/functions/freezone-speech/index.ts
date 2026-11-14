@@ -22,6 +22,33 @@ const geminiVoiceByCharacter: Record<string, string> = {
   sage: 'Kore',
   shimmer: 'Aoede'
 };
+const qwenVoiceByCharacter: Record<string, string> = {
+  alloy: 'Cherry',
+  ash: 'Ethan',
+  ballad: 'Ryan',
+  coral: 'Serena',
+  echo: 'Vincent',
+  fable: 'Momo',
+  onyx: 'Moon',
+  nova: 'Bella',
+  sage: 'Eldric Sage',
+  shimmer: 'Vivian'
+};
+const qwenVoiceIds = new Set([
+  'Cherry', 'Serena', 'Ethan', 'Chelsie', 'Momo', 'Vivian', 'Moon', 'Maia',
+  'Kai', 'Bella', 'Jennifer', 'Ryan', 'Katerina', 'Aiden', 'Eldric Sage',
+  'Mia', 'Mochi', 'Bellona', 'Vincent', 'Bunny', 'Neil', 'Elias', 'Arthur',
+  'Nini', 'Seren', 'Pip', 'Stella', 'Bodega', 'Sonrisa', 'Alek', 'Dolce',
+  'Sohee', 'Ono Anna', 'Lenn', 'Emilien', 'Andre', 'Radio Gol'
+]);
+const kokoroVoiceIds = new Set([
+  'af_heart', 'af_alloy', 'af_aoede', 'af_bella', 'af_jessica', 'af_kore',
+  'af_nicole', 'af_nova', 'af_river', 'af_sarah', 'af_sky', 'am_adam',
+  'am_echo', 'am_eric', 'am_fenrir', 'am_liam', 'am_michael', 'am_onyx',
+  'am_puck', 'am_santa', 'bf_alice', 'bf_emma', 'bf_isabella', 'bf_lily',
+  'bm_daniel', 'bm_fable', 'bm_george', 'bm_lewis', 'ef_dora', 'em_alex',
+  'em_santa', 'pf_dora', 'pm_alex', 'pm_santa'
+]);
 const voiceEvents = new Set([
   'entry', 'move', 'capture', 'death', 'allyDeath', 'purchase', 'upgrade',
   'inactivity', 'inspection', 'victory', 'defeat', 'vulnerable'
@@ -203,6 +230,118 @@ function audioResponse(audio: Uint8Array, contentType: string) {
   });
 }
 
+async function generateQwen3Speech(
+  apiKey: string,
+  text: string,
+  voice: string,
+  language: string,
+  model: string
+) {
+  const languageType = language === 'pt-BR' ? 'Portuguese'
+    : language === 'es-ES' ? 'Spanish' : 'English';
+  const response = await fetch(
+    'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation',
+    {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: model || 'qwen3-tts-flash',
+        input: {
+          text,
+          voice,
+          language_type: languageType
+        }
+      })
+    }
+  );
+  if (!response.ok) {
+    throw new FreezoneFunctionError(`Qwen3-TTS request failed (${response.status}).`, 502);
+  }
+  const result = await response.json();
+  const audioUrl = result?.output?.audio?.url;
+  if (typeof audioUrl !== 'string') {
+    throw new FreezoneFunctionError('Qwen3-TTS returned no audio.', 502);
+  }
+  let parsedAudioUrl: URL;
+  try {
+    parsedAudioUrl = new URL(audioUrl);
+  } catch {
+    throw new FreezoneFunctionError('Qwen3-TTS returned an invalid audio URL.', 502);
+  }
+  if (!['http:', 'https:'].includes(parsedAudioUrl.protocol) ||
+      !parsedAudioUrl.hostname.endsWith('.aliyuncs.com') ||
+      parsedAudioUrl.username || parsedAudioUrl.password) {
+    throw new FreezoneFunctionError('Qwen3-TTS returned an untrusted audio URL.', 502);
+  }
+  const audioResponseFromProvider = await fetch(parsedAudioUrl, { redirect: 'error' });
+  if (!audioResponseFromProvider.ok) {
+    throw new FreezoneFunctionError('Could not download Qwen3-TTS audio.', 502);
+  }
+  const contentLength = Number(audioResponseFromProvider.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > 4 * 1024 * 1024) {
+    throw new FreezoneFunctionError('Qwen3-TTS audio exceeded the size limit.', 502);
+  }
+  const audio = new Uint8Array(await audioResponseFromProvider.arrayBuffer());
+  if (audio.byteLength > 4 * 1024 * 1024) {
+    throw new FreezoneFunctionError('Qwen3-TTS audio exceeded the size limit.', 502);
+  }
+  return audio;
+}
+
+async function generateKokoroSpeech(text: string, voice: string, suppliedApiKey: string) {
+  const endpoint = Deno.env.get('KOKORO_TTS_URL');
+  if (!endpoint) {
+    throw new FreezoneFunctionError('Configure KOKORO_TTS_URL for the self-hosted Kokoro service.', 503);
+  }
+  const apiKey = suppliedApiKey || Deno.env.get('KOKORO_API_KEY') || '';
+  if (!apiKey) {
+    throw new FreezoneFunctionError('Configure KOKORO_API_KEY for the self-hosted Kokoro service.', 503);
+  }
+  let url: URL;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    throw new FreezoneFunctionError('KOKORO_TTS_URL is not a valid URL.', 503);
+  }
+  const isLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if ((url.protocol !== 'https:' && !(url.protocol === 'http:' && isLoopback)) ||
+      url.username || url.password || url.hash || url.search) {
+    throw new FreezoneFunctionError('KOKORO_TTS_URL must use HTTPS and cannot include credentials, a query, or a fragment.', 503);
+  }
+  const language = voice.startsWith('p') ? 'pt-BR'
+    : voice.startsWith('e') ? 'es-ES'
+      : voice.startsWith('b') ? 'en-GB' : 'en-US';
+  const response = await fetch(url, {
+    method: 'POST',
+    redirect: 'error',
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+      Accept: 'audio/wav'
+    },
+    body: JSON.stringify({ text, voice, language })
+  });
+  if (!response.ok) {
+    throw new FreezoneFunctionError(`Kokoro server request failed (${response.status}).`, 502);
+  }
+  const contentType = response.headers.get('content-type')?.split(';')[0].trim().toLowerCase();
+  if (!['audio/wav', 'audio/x-wav'].includes(contentType || '')) {
+    throw new FreezoneFunctionError('Kokoro server returned an unsupported audio type.', 502);
+  }
+  const contentLength = Number(response.headers.get('content-length'));
+  if (Number.isFinite(contentLength) && contentLength > 4 * 1024 * 1024) {
+    throw new FreezoneFunctionError('Kokoro server audio exceeded the size limit.', 502);
+  }
+  const audio = new Uint8Array(await response.arrayBuffer());
+  if (!audio.byteLength || audio.byteLength > 4 * 1024 * 1024) {
+    throw new FreezoneFunctionError('Kokoro server audio was empty or too large.', 502);
+  }
+  return audio;
+}
+
 Deno.serve(async (request) => {
   if (request.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
   if (request.method !== 'POST') {
@@ -246,30 +385,67 @@ Deno.serve(async (request) => {
     }
 
     const provider = typeof body.provider === 'string' ? body.provider : 'gemini-live';
-    if (!['gemini-live', 'gemini-tts', 'openai-tts', 'google-tts'].includes(provider)) {
-      throw new FreezoneFunctionError('Choose Gemini Live, Gemini TTS, OpenAI TTS, or Google Cloud TTS.');
+    if (!['gemini-live', 'gemini-tts', 'openai-tts', 'google-tts', 'qwen3-tts', 'kokoro'].includes(provider)) {
+      throw new FreezoneFunctionError('Choose a supported speech provider, including Kokoro.');
     }
-    const keySetting = provider === 'openai-tts' ? 'OPENAI_API_KEY'
-      : provider === 'google-tts' ? 'GOOGLE_TTS_API_KEY'
-        : 'GEMINI_API_KEY';
-    const apiKey = limitedText(body.apiKey, 512) || Deno.env.get(keySetting);
-    if (!apiKey) {
-      throw new FreezoneFunctionError(`Add a ${provider} API key in Freezone settings or configure it on the server.`, 503);
-    }
-    const model = limitedText(body.model, 128).replace(/[^a-zA-Z0-9._:/-]/g, '');
     const rateKey = `${roomCode}:${playerToken}:${isTest ? 'connection-test' : pieceId}`;
     const now = Date.now();
     if (now - (requestTimes.get(rateKey) || 0) < 1500) {
       throw new FreezoneFunctionError('Please wait before requesting another character voice.', 429);
     }
     requestTimes.set(rateKey, now);
+    if (provider === 'kokoro') {
+      const pieceVoice = limitedText(piece?.kokoroVoice, 32);
+      const requestedVoice = limitedText(body.kokoroVoice, 32);
+      const kokoroVoice = kokoroVoiceIds.has(pieceVoice) ? pieceVoice
+        : kokoroVoiceIds.has(requestedVoice) ? requestedVoice : 'af_heart';
+      return audioResponse(
+        await generateKokoroSpeech(text, kokoroVoice, limitedText(body.apiKey, 512)),
+        'audio/wav'
+      );
+    }
+    const keySetting = provider === 'openai-tts' ? 'OPENAI_API_KEY'
+      : provider === 'google-tts' ? 'GOOGLE_TTS_API_KEY'
+        : provider === 'qwen3-tts' ? 'DASHSCOPE_API_KEY'
+          : 'GEMINI_API_KEY';
+    const apiKey = limitedText(body.apiKey, 512) || Deno.env.get(keySetting);
+    if (!apiKey) {
+      throw new FreezoneFunctionError(`Add a ${provider} API key in Freezone settings or configure it on the server.`, 503);
+    }
+    const model = limitedText(body.model, 128).replace(/[^a-zA-Z0-9._:/-]/g, '');
 
-    const language = isTest
-      ? limitedText(body.language, 16) || 'pt-BR'
-      : limitedText(piece?.language, 16) || 'en-US';
+    const requestedLanguage = limitedText(body.language, 16);
+    const profileLanguage = limitedText(piece?.language, 16);
+    const language = ['pt-BR', 'en-US', 'es-ES'].includes(requestedLanguage)
+      ? requestedLanguage
+      : isTest ? 'pt-BR'
+        : ['pt-BR', 'en-US', 'es-ES'].includes(profileLanguage)
+          ? profileLanguage
+          : 'en-US';
     const personality = isTest ? '' : limitedText(piece?.personality, 160);
-    const voice = isTest ? 'alloy' : limitedText(piece?.aiVoice, 32);
+    const voice = isTest ? limitedText(body.voiceId, 32) || 'alloy' : limitedText(piece?.aiVoice, 32);
     const geminiVoice = geminiVoiceByCharacter[voice] || 'Kore';
+    if (provider === 'qwen3-tts') {
+      const pieceQwenVoice = limitedText(piece?.qwenVoice, 64);
+      const requestedQwenVoice = limitedText(body.qwenVoice, 64);
+      const qwenVoice = qwenVoiceIds.has(pieceQwenVoice) ? pieceQwenVoice
+        : qwenVoiceIds.has(requestedQwenVoice) ? requestedQwenVoice
+          : qwenVoiceByCharacter[voice] || 'Cherry';
+      const requestedQwenLanguage = limitedText(body.qwenLanguage, 16);
+      const qwenLanguage = ['pt-BR', 'en-US', 'es-ES'].includes(requestedQwenLanguage)
+        ? requestedQwenLanguage
+        : language;
+      return audioResponse(
+        await generateQwen3Speech(
+          apiKey,
+          text,
+          qwenVoice,
+          qwenLanguage,
+          model || 'qwen3-tts-flash'
+        ),
+        'audio/wav'
+      );
+    }
     if (provider === 'gemini-live') {
       return audioResponse(
         await generateGeminiLiveSpeech(

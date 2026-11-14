@@ -6,6 +6,9 @@ import zlib from 'node:zlib';
 import {
   FREEZONE_AI_LANGUAGES,
   FREEZONE_AI_VOICES,
+  FREEZONE_KOKORO_BROWSER_VOICE_IDS,
+  FREEZONE_KOKORO_VOICES,
+  FREEZONE_QWEN_VOICES,
   FREEZONE_APPEARANCES,
   FREEZONE_VOICE_EVENTS,
   FREEZONE_MAX_BOTS,
@@ -14,6 +17,7 @@ import {
   FREEZONE_ROOM_TAGS,
   applyFreezoneAllyPurchase,
   configureFreezoneBots,
+  getFreezoneBotMoveDelay,
   formatFreezoneSessionAge,
   getFreezoneSeatOccupancy,
   getFreezoneEliminationLeaders,
@@ -23,6 +27,8 @@ import {
   expireFreezoneSessions,
   incrementFreezoneEliminations,
   mergeFreezoneRoomState,
+  normalizeFreezoneRelations,
+  normalizeFreezoneAllianceInvitations,
   reconcileFreezonePresence,
   reclaimStaleFreezoneSeatClaims,
   resolveFreezoneVoice,
@@ -49,9 +55,14 @@ import {
   updateFreezoneAISettings
 } from '../src/freezoneAISettings.js';
 import {
+  chooseFreezoneFallbackMove,
   FREEZONE_AI_IDLE_GRACE_MS,
+  FREEZONE_AMBIENT_DIALOGUE_IDLE_MS,
+  createFreezoneLocalDialogue,
   freezoneAICandidateId,
   hasFreezoneAIActions,
+  isFreezoneAIMoveProviderFailure,
+  isFreezoneAIMoveStateConflict,
   normalizeFreezoneAIDecision,
   shouldRequestFreezoneAIVoice
 } from '../src/freezoneAi.js';
@@ -71,6 +82,7 @@ import {
   FREEZONE_ALLY_XP_COST,
   applyFreezoneOrbCollection,
   applyFreezoneOrbPurchase,
+  applyFreezoneUpgradePayment,
   advanceFreezoneMutantZone,
   applyFreezoneMovementUnlock,
   canUpgradeFreezoneEnvelope,
@@ -316,6 +328,29 @@ test('Freezone XP orb purchases enforce price and balance without negative curre
   assert.equal(applyFreezoneOrbPurchase({ xp: 199 }, 'red').ok, false);
   assert.equal(applyFreezoneOrbPurchase({ xp: 1000 }, 'bot').ok, false);
   assert.equal(applyFreezoneOrbPurchase({ xp: -20 }, 'red').ok, false);
+});
+
+test('Freezone upgrades can use an orb or matching XP without charging both', () => {
+  const player = { xp: 70, orbBalances: { blue: 2, white: 4, movement: 1 } };
+  const orbPayment = applyFreezoneUpgradePayment(player, 'blue', 1, 25, 'orb');
+  assert.equal(orbPayment.ok, true);
+  assert.equal(orbPayment.player.xp, 70);
+  assert.equal(orbPayment.player.orbBalances.blue, 1);
+
+  const xpPayment = applyFreezoneUpgradePayment(player, 'blue', 1, 25, 'xp');
+  assert.equal(xpPayment.ok, true);
+  assert.equal(xpPayment.cost, 25);
+  assert.equal(xpPayment.player.xp, 45);
+  assert.equal(xpPayment.player.orbBalances.blue, 2);
+
+  const multiOrbPayment = applyFreezoneUpgradePayment(player, 'white', 2, 40, 'orb');
+  assert.equal(multiOrbPayment.ok, true);
+  assert.equal(multiOrbPayment.player.orbBalances.white, 2);
+  assert.equal(applyFreezoneUpgradePayment(player, 'blue', 3, 25, 'orb').ok, false);
+  assert.equal(applyFreezoneUpgradePayment(player, 'blue', 1, 80, 'xp').ok, false);
+  assert.equal(applyFreezoneUpgradePayment(player, 'xp', 1, 10, 'orb').ok, false);
+  assert.equal(player.xp, 70);
+  assert.equal(player.orbBalances.blue, 2);
 });
 
 test('Freezone movement cards charge a separate orb and count only newly added offsets', () => {
@@ -571,7 +606,7 @@ test('Simplified Single-Player HUD in src/App.tsx excludes speed sliders, notati
   }
 });
 
-test('Main menu orders multiplayer first and keeps mode actions out of the in-game controls', () => {
+test('Main menu keeps game modes out of in-game controls and exposes display settings', () => {
   const appTsx = fs.readFileSync(path.join(ROOT, 'src/App.tsx'), 'utf-8');
   const menuStart = appTsx.indexOf('className={`main-menu-overlay');
   const menuEnd = appTsx.indexOf('className={`multiplayer-overlay', menuStart);
@@ -592,11 +627,155 @@ test('Main menu orders multiplayer first and keeps mode actions out of the in-ga
   assert.ok(appTsx.includes('id="btn-main-menu"'));
   assert.ok(appTsx.includes('leaveCurrentGame()'));
   assert.ok(appTsx.includes("new Event('wizard-chess-open-freezone')"));
-  assert.ok(appTsx.indexOf('<FreezonePanel mainMenuOpen={mainMenuOpen} />') >
-    appTsx.indexOf('className={`main-menu-overlay'));
+  assert.ok(appTsx.includes('className="display-settings-open"'));
+  assert.ok(appTsx.includes('<FreezonePanel'));
+  assert.ok(appTsx.includes('displayPreferences={displayPreferences}'));
   for (const hiddenMode of ['Multiplayer', 'Free Mode', 'New Game', 'Mode Creator']) {
     assert.ok(!controls.includes(hiddenMode), `${hiddenMode} should not appear in in-game controls`);
   }
+});
+
+test('Main menu applies the glass-and-gold finish to the card without altering the scene backdrop', () => {
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+  const dialogStart = styles.indexOf('.main-menu-dialog {');
+  const dialogEnd = styles.indexOf('.main-menu-eyebrow {', dialogStart);
+  const dialogStyles = styles.slice(dialogStart, dialogEnd);
+  const overlayStart = styles.indexOf('.main-menu-overlay {');
+  const overlayEnd = styles.indexOf('.main-menu-overlay.open {', overlayStart);
+  const overlayStyles = styles.slice(overlayStart, overlayEnd);
+
+  assert.ok(dialogStyles.includes('isolation: isolate;'));
+  assert.ok(dialogStyles.includes('.main-menu-dialog::before'));
+  assert.ok(dialogStyles.includes('rgba(221, 185, 92, 0.14)'));
+  assert.ok(overlayStyles.includes('background: rgba(3, 5, 9, 0.46);'));
+  assert.ok(overlayStyles.includes('backdrop-filter: blur(2px);'));
+  assert.ok(styles.includes('.main-menu-overlay {\n    padding: 12px;'));
+  assert.ok(styles.includes('.main-menu-dialog {\n    width: min(460px, 100%);'));
+  assert.ok(styles.includes('min-height: min(302px, calc(100dvh - 24px));'));
+  assert.ok(styles.includes('padding: 40px;'));
+});
+
+test('Music folder supplies the intro track and a looping gameplay playlist', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'src/App.tsx'), 'utf-8');
+  const musicFiles = fs.readdirSync(path.join(ROOT, 'music'));
+
+  assert.ok(musicFiles.some((file) => /brass sabers/i.test(file)));
+  assert.ok(app.includes("../music/*.{mp3,ogg,wav,m4a,aac}"));
+  assert.ok(app.includes('/brass sabers/i'));
+  assert.ok(app.includes('audio.loop = tracks.length === 1;'));
+  assert.ok(app.includes('trackIndex = (trackIndex + 1) % tracks.length;'));
+  assert.ok(app.includes("error.name === 'NotAllowedError'"));
+  assert.ok(app.includes("document.addEventListener('pointerdown', resumeAfterInteraction)"));
+  assert.ok(app.includes(': freezoneActive ? [] : gameplayMusicPlaylist'));
+});
+
+test('Display settings hide marked controls by default and persist user choices', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'src/App.tsx'), 'utf-8');
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const preferences = fs.readFileSync(path.join(ROOT, 'src/displayPreferences.ts'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+  const hiddenByDefault = [
+    'menuMultiplayer',
+    'menuTestMode',
+    'menuFreeMode',
+    'menuModeCreator',
+    'freezoneStats',
+    'freezonePlayer',
+    'freezoneTurnStatus',
+    'freezoneOnlineRoster',
+    'freezoneAdversaryBots',
+    'freezoneCamera',
+    'freezoneRadio',
+    'freezonePieceShop'
+  ];
+
+  for (const key of hiddenByDefault) {
+    assert.ok(preferences.includes(`${key}: false`), `${key} should be hidden by default`);
+    assert.ok(app.includes(`key: '${key}'`) || app.includes(`displayPreferences.${key}`) ||
+      panel.includes(`displayPreferences.${key}`), `${key} should have a visibility control`);
+  }
+  assert.ok(app.includes('className="display-settings-open"'));
+  assert.ok(panel.includes('className="hud-btn freezone-display-settings"'));
+  assert.ok(app.includes('localStorage.setItem'));
+  assert.ok(preferences.includes('freezoneReturnMenu: true'));
+  assert.ok(preferences.includes('preferences.freezoneReturnMenu = true'));
+  assert.ok(preferences.includes('wizard-chess-display-preferences-v2'));
+  assert.ok(preferences.includes('wizard-chess-display-preferences-v1'));
+  assert.ok(app.includes('displayPreferences.freezoneReturnMenu'));
+  assert.ok(app.includes("displayPreferences.freezoneTurnStatus ? 'none'"));
+  assert.ok(styles.includes('backdrop-filter: blur(2px);'));
+});
+
+test('Freezone metadata sync preserves the world and reconciles only changed entities', () => {
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const renderStart = engine.indexOf('function renderFreeModeState(state)');
+  const renderEnd = engine.indexOf('function setFreeMode(', renderStart);
+  const render = engine.slice(renderStart, renderEnd);
+
+  assert.ok(render.includes('const shouldRebuildWorld = nextWorldSignature !== freeWorldVisualSignature'));
+  assert.ok(render.includes('if (shouldRebuildWorld) clearFreeWorld();'));
+  assert.ok(render.includes('reconcileFreezonePieces(normalized.pieces)'));
+  assert.ok(render.includes('reconcileFreezoneOrbs(normalized.xpOrbs)'));
+  assert.ok(engine.includes('function syncFreezonePiece(data)'));
+  assert.ok(engine.includes('function reconcileFreezoneOrbs(orbs)'));
+});
+
+test('Freezone camera far plane covers the board at maximum zoom', () => {
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  assert.ok(engine.includes('const freezoneMaxDistance = 60;'));
+  assert.ok(engine.includes('Math.SQRT2 * customGameConfig.boardSize * BOARD_SQ_SIZE * 0.5 + 6'));
+  assert.ok(engine.includes('camera.updateProjectionMatrix();'));
+});
+
+test('Eye control and H shortcut hide all screen UI but preserve the restore control', () => {
+  const app = fs.readFileSync(path.join(ROOT, 'src/App.tsx'), 'utf-8');
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+
+  assert.ok(app.includes('id="btn-hide-ui"'));
+  assert.ok(app.includes('onClick={handleHideUI}'));
+  assert.ok(app.includes('window.wizardChess.toggleUI(true)'));
+  assert.ok(app.includes('id="btn-mobile-show-ui"'));
+  assert.ok(engine.includes("e.code === 'KeyH' || e.code === 'KeyU'"));
+  assert.ok(engine.includes("document.body.classList.toggle('cinematic-ui-hidden', shouldHide)"));
+  for (const selector of [
+    '#hud-top',
+    '#hud-bottom',
+    '.freezone-room-ranking',
+    '.freezone-piece-cooldowns',
+    '.freezone-hud',
+    '.freezone-overlay'
+  ]) {
+    assert.ok(styles.includes(`body.cinematic-ui-hidden ${selector}`), `${selector} should hide`);
+  }
+  assert.ok(styles.includes('body.cinematic-ui-hidden .ui-restore-btn'));
+});
+
+test('Freezone rank and Arena modal use the medieval gold treatment without replacing live metrics', () => {
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+
+  assert.ok(panel.includes('<strong>ROOM RANK</strong>'));
+  assert.ok(panel.includes('player.crown &&'));
+  assert.ok(panel.includes('formatFreezoneRankingNumber(player.kills)'));
+  assert.ok(panel.includes('formatFreezoneRankingNumber(player.xp)'));
+  assert.ok(panel.includes('formatFreezoneRankingNumber(player.orbsCollected)'));
+  assert.ok(panel.includes('formatFreezoneRankingNumber(player.pieces)'));
+  assert.ok(panel.includes('player.timeLabel || formatFreezoneSessionAge'));
+  assert.ok(styles.includes('.freezone-room-ranking::before'));
+  assert.ok(styles.includes('.freezone-room-ranking-position'));
+  assert.ok(styles.includes('.freezone-room-ranking-metric.orbs > span'));
+  assert.ok(styles.includes('.freezone-dialog::before'));
+  assert.ok(styles.includes('@media (max-width: 768px)'));
+});
+
+test('Freezone notifications use a responsive gold-framed toast with a medal icon', () => {
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+
+  assert.ok(styles.includes('.freezone-toast::before'));
+  assert.ok(styles.includes('content: "♜";'));
+  assert.ok(styles.includes('rgba(235, 192, 106, 0.88)'));
+  assert.ok(styles.includes('@media (max-width: 480px)'));
 });
 
 test('Camera views are selected from one control and preserve flip and free-look states', () => {
@@ -652,6 +831,8 @@ test('Freezone appearance selection and public profile are normalized for persis
     personality: 'x'.repeat(300),
     language: 'invalid',
     aiVoice: 'invalid',
+    qwenVoice: 'not-a-qwen-voice',
+    kokoroVoice: 'not-a-kokoro-voice',
     voiceLines: { inspection: '  Welcome  ', unknown: 'ignored' }
   });
   assert.equal(profile.appearance, 'dragon');
@@ -660,11 +841,19 @@ test('Freezone appearance selection and public profile are normalized for persis
   assert.equal(profile.personality.length, 240);
   assert.equal(profile.language, 'en-US');
   assert.equal(profile.aiVoice, 'alloy');
+  assert.equal(profile.qwenVoice, '');
+  assert.equal(profile.kokoroVoice, '');
   assert.equal(profile.voiceLines.inspection, 'Welcome');
   assert.equal(profile.voiceLines.victory, '');
   assert.equal(sanitizeFreezoneProfile({ appearance: 'external-model' }).appearance, '');
   assert.ok(FREEZONE_AI_LANGUAGES.some(({ id }) => id === profile.language));
   assert.ok(FREEZONE_AI_VOICES.some(({ id }) => id === profile.aiVoice));
+  assert.ok(FREEZONE_QWEN_VOICES.some(({ id }) => id === 'Bellona'));
+  assert.ok(FREEZONE_KOKORO_VOICES.some(({ id }) => id === 'pf_dora'));
+  assert.equal(FREEZONE_KOKORO_BROWSER_VOICE_IDS.has('af_heart'), true);
+  assert.equal(FREEZONE_KOKORO_BROWSER_VOICE_IDS.has('pf_dora'), false);
+  assert.equal(sanitizeFreezoneProfile({ qwenVoice: 'Bellona' }).qwenVoice, 'Bellona');
+  assert.equal(sanitizeFreezoneProfile({ kokoroVoice: 'pf_dora' }).kokoroVoice, 'pf_dora');
   assert.ok(FREEZONE_VOICE_EVENTS.some(({ id }) => id === 'move'));
   assert.ok(FREEZONE_VOICE_EVENTS.some(({ id }) => id === 'death'));
 });
@@ -693,8 +882,139 @@ test('Freezone provider keys stay in session memory and Gemini Live is the defau
   assert.equal(getFreezoneAIRequestSettings().textApiKey, '');
   assert.equal(getFreezoneAIRequestSettings().voiceApiKey, '');
   assert.equal(getFreezoneAISettings().apiKeys.google, '');
+  assert.equal(getFreezoneAISettings().apiKeys.dashscope, '');
 });
 
+test('Qwen3-TTS is available as a multilingual speech provider', () => {
+  updateFreezoneAISettings({
+    voiceProvider: 'qwen3-tts',
+    qwenVoice: 'Bellona',
+    qwenLanguage: 'pt-BR',
+    serviceApiKeys: { speech: 'dashscope-session-key' }
+  });
+  const settings = getFreezoneAIRequestSettings();
+  assert.equal(settings.voiceProvider, 'qwen3-tts');
+  assert.equal(settings.voiceModel, 'qwen3-tts-flash');
+  assert.equal(settings.voiceApiKey, 'dashscope-session-key');
+  assert.equal(settings.qwenVoice, 'Bellona');
+  assert.equal(settings.qwenLanguage, 'pt-BR');
+
+  const speech = fs.readFileSync(
+    path.join(ROOT, 'supabase/functions/freezone-speech/index.ts'),
+    'utf-8'
+  );
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const multiplayer = fs.readFileSync(path.join(ROOT, 'src/multiplayerSupabase.js'), 'utf-8');
+  assert.ok(speech.includes("'https://dashscope-intl.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation'"));
+  assert.ok(speech.includes("language === 'pt-BR' ? 'Portuguese'"));
+  assert.ok(speech.includes("language === 'es-ES' ? 'Spanish'"));
+  assert.ok(speech.includes("alloy: 'Cherry'"));
+  assert.ok(speech.includes("echo: 'Vincent'"));
+  assert.ok(speech.includes("qwenVoiceIds.has(pieceQwenVoice)"));
+  assert.ok(speech.includes("qwenVoiceIds.has(requestedQwenVoice)"));
+  assert.ok(speech.includes("['pt-BR', 'en-US', 'es-ES'].includes(requestedQwenLanguage)"));
+  assert.ok(speech.includes('result?.output?.audio?.url'));
+  assert.ok(speech.includes("parsedAudioUrl.hostname.endsWith('.aliyuncs.com')"));
+  assert.ok(panel.includes('Default Qwen voice'));
+  assert.ok(panel.includes('Qwen speech language'));
+  assert.ok(panel.includes('Qwen voice for this piece'));
+  assert.ok(panel.includes('Qwen voice'));
+  assert.ok(engine.includes('piece.freeQwenVoice = safeProfile.qwenVoice'));
+  assert.ok(engine.includes('qwenVoice: piece.freeQwenVoice ||'));
+  assert.ok(multiplayer.includes('qwenVoice: settings.qwenVoice'));
+  assert.ok(multiplayer.includes('qwenLanguage: settings.qwenLanguage'));
+
+  clearFreezoneAIKeys();
+  updateFreezoneAISettings({
+    voiceProvider: 'gemini-live',
+    voiceModel: 'models/gemini-3.8-live',
+    qwenVoice: '',
+    qwenLanguage: 'piece'
+  });
+});
+
+test('Freezone character speech can switch between server TTS, browser voices, and local Kokoro', () => {
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const speechStart = panel.indexOf('<h4>Character speech</h4>');
+  const speechEnd = panel.indexOf('</article>', speechStart);
+  const speechSettings = panel.slice(speechStart, speechEnd);
+
+  assert.ok(panel.includes("readLocalSetting('freezone-ai-voice-mode') === 'fallback' ? 'fallback' : 'tts'"));
+  assert.ok(panel.includes("window.localStorage.setItem('freezone-ai-voice-mode', aiVoiceMode)"));
+  assert.ok(speechSettings.includes('Speech source'));
+  assert.ok(speechSettings.includes('<option value="tts">AI TTS provider (default)</option>'));
+  assert.ok(speechSettings.includes('<option value="fallback">Local fallback · browser or Kokoro</option>'));
+  assert.ok(speechSettings.includes('<option value="kokoro">Kokoro-82M · self-hosted</option>'));
+  assert.ok(speechSettings.includes('<option value="kokoro">Kokoro-82M · local model</option>'));
+  assert.ok(speechSettings.includes('Fallback browser voice'));
+  assert.ok(speechSettings.includes('Kokoro fallback voice'));
+  assert.ok(speechSettings.includes('Test Kokoro voice'));
+  assert.ok(speechSettings.includes('TTS provider'));
+  assert.ok(panel.includes("const localFallback = aiVoiceMode === 'fallback'"));
+  assert.ok(panel.includes("aiVoiceModeRef.current !== 'fallback'"));
+  assert.ok(panel.includes("aiVoiceModeRef.current !== 'tts'"));
+  assert.ok(panel.includes('utterance.voice = voice || null'));
+  assert.ok(panel.includes('language: detail.language'));
+  assert.ok(panel.includes('language: speaker.language'));
+  assert.ok(panel.includes('window.speechSynthesis.speak(utterance)'));
+  assert.ok(panel.includes('utterance.lang = detail.language || \'en-US\''));
+  assert.ok(panel.includes('generateFreezoneKokoroSpeech'));
+  assert.ok(panel.includes('preloadFreezoneKokoroSpeech'));
+  assert.ok(panel.includes('aiVoiceAbortRef.current?.abort()'));
+  assert.ok(panel.includes('aiVoiceRequestIdRef.current !== requestId'));
+  assert.ok(!panel.includes('aiVoiceQueueRef'));
+  assert.ok(!panel.includes('The local Kokoro voice is ready.'));
+  assert.ok(panel.includes('voiceCooldowns.current.delete(cooldownKey)'));
+  assert.ok(panel.includes('if (now - (voiceCooldowns.current.get(cooldownKey) || 0) < 700) return;'));
+  assert.ok(panel.includes('KOKORO_TTS_URL and KOKORO_API_KEY'));
+  assert.ok(panel.includes('kokoroVoice: pieceKokoroVoice'));
+  assert.ok(panel.includes('Kokoro voice for this piece'));
+});
+
+test('Kokoro browser and self-hosted modes use the selected voice and preserve per-piece choices', () => {
+  updateFreezoneAISettings({
+    voiceProvider: 'kokoro',
+    kokoroVoice: 'pf_dora',
+    serviceApiKeys: { speech: 'kokoro-session-secret' }
+  });
+  const settings = getFreezoneAIRequestSettings();
+  assert.equal(settings.voiceProvider, 'kokoro');
+  assert.equal(settings.voiceModel, 'kokoro-82m');
+  assert.equal(settings.voiceApiKey, 'kokoro-session-secret');
+  assert.equal(settings.kokoroVoice, 'pf_dora');
+
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const worker = fs.readFileSync(path.join(ROOT, 'src/freezoneKokoro.worker.js'), 'utf-8');
+  const settingsSource = fs.readFileSync(path.join(ROOT, 'src/freezoneAISettings.js'), 'utf-8');
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const speech = fs.readFileSync(path.join(ROOT, 'supabase/functions/freezone-speech/index.ts'), 'utf-8');
+  const service = fs.readFileSync(path.join(ROOT, 'services/kokoro/main.py'), 'utf-8');
+  assert.ok(worker.includes("createTTS('wasm', requestId)"));
+  assert.ok(worker.includes("createTTS('webgpu', requestId)"));
+  assert.ok(worker.includes("dtype: useWebGPU ? 'fp32' : 'q8'"));
+  assert.ok(worker.includes('newer character line replaced this one'));
+  assert.ok(worker.includes('onnx-community/Kokoro-82M-v1.0-ONNX'));
+  assert.ok(panel.includes('FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(voiceId)'));
+  assert.ok(settingsSource.includes("kokoro: 'kokoro-82m'"));
+  assert.ok(speech.includes('KOKORO_TTS_URL'));
+  assert.ok(speech.includes('KOKORO_API_KEY'));
+  assert.ok(speech.includes('kokoroVoiceIds.has(pieceVoice)'));
+  assert.ok(speech.includes("voice.startsWith('p') ? 'pt-BR'"));
+  assert.ok(service.includes('@app.post("/v1/speech")'));
+  assert.ok(service.includes('hmac.compare_digest'));
+  assert.ok(service.includes('"pf_dora pm_alex pm_santa"'));
+  assert.ok(engine.includes('piece.freeKokoroVoice = safeProfile.kokoroVoice'));
+  assert.ok(engine.includes('cooldownKey.startsWith(`${pieceId}:`)'));
+  assert.ok(engine.includes('kokoroVoice: piece.freeKokoroVoice ||'));
+
+  clearFreezoneAIKeys();
+  updateFreezoneAISettings({
+    voiceProvider: 'gemini-live',
+    kokoroVoice: 'af_heart',
+    serviceApiKeys: { speech: '' }
+  });
+});
 test('Freezone movement, dialogue, and speech providers have independent models and session keys', () => {
   updateFreezoneAISettings({
     movementProvider: 'deepseek',
@@ -760,6 +1080,7 @@ test('Freezone OpenRouter uses the Supabase secret by default with a paid model 
   assert.ok(edge.includes('pieceId: piece.id, text'));
   assert.ok(edge.includes("body.action === 'test'"));
   assert.ok(speech.includes("body.action === 'test'"));
+  assert.ok(speech.includes('requestedLanguage'));
   assert.ok(panel.includes("['api', 'AI & APIs']"));
   assert.ok(panel.includes('Test movement action'));
   assert.ok(panel.includes('Test text & bubble'));
@@ -774,6 +1095,9 @@ test('Freezone OpenRouter uses the Supabase secret by default with a paid model 
   const dialogueQueueEnd = engine.indexOf('function updateFreezoneSpeech', dialogueQueueStart);
   assert.ok(engine.slice(dialogueQueueStart, dialogueQueueEnd).includes('updateFreezoneSpeech();'));
   assert.ok(panel.includes('Use AI for my purchased bots'));
+  assert.ok(panel.includes('Local fallback and bot dialogue language'));
+  assert.ok(engine.includes('scheduleFreezoneAmbientDialogue'));
+  assert.ok(engine.includes('aiHistory: isFreezoneState ? sanitizeFreezoneAIHistory(state?.aiHistory) : []'));
   assert.ok(panel.includes('serviceApiKeys.movement'));
   assert.ok(panel.includes('serviceApiKeys.dialogue'));
   assert.ok(panel.includes('serviceApiKeys.speech'));
@@ -874,23 +1198,78 @@ test('Freezone AI can only choose a legal candidate and optional speech respects
   assert.equal(shouldRequestFreezoneAIVoice(true, '   ', 'alloy'), false);
   assert.equal(shouldRequestFreezoneAIVoice(true, 'Hello', 'alloy'), true);
   assert.equal(shouldRequestFreezoneAIVoice(true, 'Hello', 'Kore', 'gemini-live'), true);
+  assert.equal(shouldRequestFreezoneAIVoice(true, 'Hello', 'af_heart', 'kokoro'), true);
 
   const dialogue = sanitizeFreezoneAIDialogue({
     id: 'dialogue-2',
     createdAt: 1700000000000,
     lines: [
-      { pieceId: 'piece-1', text: 'First line' },
+      { pieceId: 'piece-1', text: 'First line', language: 'pt-BR' },
       { pieceId: 'piece-2', text: 'Second line' },
       { pieceId: 'piece-3', text: 'Third line' }
     ]
   });
   assert.equal(dialogue.lines.length, 2);
+  assert.equal(dialogue.lines[0].language, 'pt-BR');
   const staleSave = mergeFreezoneRoomState(
     { aiDialogue: null },
     { aiDialogue: null },
     { aiDialogue: dialogue }
   );
   assert.equal(staleSave.aiDialogue.id, 'dialogue-2');
+});
+
+test('Freezone local dialogue uses event context, selected language, and two bot speakers', () => {
+  const firstMove = createFreezoneLocalDialogue({
+    event: 'move',
+    language: 'pt-BR',
+    speaker: { id: 'bot-1', name: 'Lince' },
+    id: 'local-move-1',
+    createdAt: 100,
+    random: () => 0
+  });
+  const variedMove = createFreezoneLocalDialogue({
+    event: 'move',
+    language: 'pt-BR',
+    speaker: { id: 'bot-1', name: 'Lince' },
+    history: firstMove.lines,
+    id: 'local-move-2',
+    createdAt: 101,
+    random: () => 0
+  });
+  const capture = createFreezoneLocalDialogue({
+    event: 'capture',
+    language: 'es-ES',
+    speaker: { id: 'bot-1', name: 'Lince' },
+    capturedName: 'Torre',
+    orbType: 'xp',
+    id: 'local-capture',
+    createdAt: 102,
+    random: () => 0
+  });
+  const ambient = createFreezoneLocalDialogue({
+    event: 'ambient',
+    language: 'en-US',
+    speaker: { id: 'bot-1', name: 'Lynx' },
+    listener: { id: 'bot-2', name: 'Owl' },
+    id: 'local-ambient',
+    createdAt: 103,
+    random: () => 0
+  });
+
+  assert.notEqual(variedMove.lines[0].text, firstMove.lines[0].text);
+  assert.equal(firstMove.lines[0].language, 'pt-BR');
+  assert.match(capture.lines[0].text, /Torre/);
+  assert.match(capture.lines[0].text, /orbe XP/);
+  assert.equal(capture.lines[0].language, 'es-ES');
+  assert.deepEqual(ambient.lines.map(({ pieceId }) => pieceId), ['bot-1', 'bot-2']);
+  assert.equal(ambient.lines.length, 2);
+  assert.equal(ambient.lines[0].language, 'en-US');
+  assert.equal(createFreezoneLocalDialogue({
+    event: 'ambient',
+    speaker: { id: 'bot-1' }
+  }), null);
+  assert.equal(FREEZONE_AMBIENT_DIALOGUE_IDLE_MS, 45000);
 });
 
 test('Freezone AI teammate skips a resting or exhausted action cycle', () => {
@@ -913,6 +1292,61 @@ test('Freezone AI teammate skips a resting or exhausted action cycle', () => {
   const request = engine.slice(requestStart, requestEnd);
   assert.ok(request.indexOf('if (!hasFreezoneAIActions(player)) return;') <
     request.indexOf('requestFreezoneAIMove({'));
+});
+
+test('Freezone AI recovers from provider failures with a legal friendly move and retries stale decisions', () => {
+  const candidates = [
+    {
+      id: 'edge-move',
+      from: { r: 0, c: 0 },
+      to: { r: 0, c: 1 },
+      stepCost: 1
+    },
+    {
+      id: 'center-move',
+      from: { r: 0, c: 0 },
+      to: { r: 1, c: 1 },
+      stepCost: 1
+    },
+    {
+      id: 'capture',
+      from: { r: 0, c: 0 },
+      to: { r: 0, c: 1 },
+      stepCost: 1,
+      capture: true
+    }
+  ];
+  assert.equal(chooseFreezoneFallbackMove(candidates, 8).id, 'capture');
+  assert.equal(chooseFreezoneFallbackMove(candidates.slice(0, 2), 8).id, 'center-move');
+  assert.equal(chooseFreezoneFallbackMove([
+    { id: 'neutral-capture', from: { r: 0, c: 0 }, to: { r: 0, c: 1 }, capture: true },
+    { id: 'declared-enemy', from: { r: 0, c: 0 }, to: { r: 7, c: 7 }, capture: true, enemyCapture: true }
+  ], 8).id, 'declared-enemy');
+  assert.equal(chooseFreezoneFallbackMove([{ id: 'invalid' }], 8), null);
+
+  const providerError = Object.assign(new Error('Provider failed.'), { status: 502 });
+  const forbiddenError = Object.assign(new Error('Seat is invalid.'), { status: 403 });
+  const staleError = Object.assign(
+    new Error('The selected piece has not been synchronized yet.'),
+    { status: 409 }
+  );
+  assert.equal(isFreezoneAIMoveProviderFailure(providerError), true);
+  assert.equal(isFreezoneAIMoveProviderFailure(forbiddenError), false);
+  assert.equal(isFreezoneAIMoveStateConflict(staleError), true);
+  assert.equal(isFreezoneAIMoveStateConflict(new Error('The army is resting.')), false);
+
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const requestStart = engine.indexOf('async function requestFreezoneAITeammateAction');
+  const requestEnd = engine.indexOf('function focusFreezonePiece', requestStart);
+  const request = engine.slice(requestStart, requestEnd);
+  assert.ok(request.includes('chooseFreezoneAIFallbackCandidate'));
+  assert.ok(request.includes('!testRequestId && providerFailure'));
+  assert.ok(request.includes('moveScope === \'army\' && freezoneAIAssistEnabled'));
+  assert.ok(request.includes('|| moveScope === \'bots\''));
+  assert.ok(request.includes('using a legal local move for your team'));
+  assert.ok(request.includes('recalculating a legal move'));
+  assert.ok(engine.includes('role: ally.role'));
+  assert.ok(engine.includes("role: 'offensive'"));
 });
 
 test('Concurrent Freezone pickup claims award an orb to only one side after room merge', () => {
@@ -992,6 +1426,79 @@ test('Concurrent bot-orb pickups synchronize the dedicated ally currency once', 
   assert.equal(merged.freezonePlayers[0].orbBalances.bot + merged.freezonePlayers[1].orbBalances.bot, 1);
   assert.deepEqual(merged.orbClaims, current.orbClaims);
   assert.equal(merged.xpOrbs.length, 0);
+});
+
+test('Freezone team relations and alliance responses merge without duplicate pending invites', () => {
+  const base = {
+    seats: [{ token: 'player-a' }, { token: 'player-b' }],
+    freezoneRelations: [],
+    freezoneAllianceInvitations: [{
+      id: 'invite-1',
+      fromSide: 0,
+      toSide: 1,
+      status: 'pending',
+      createdAt: 10,
+      updatedAt: 10
+    }]
+  };
+  const local = {
+    ...base,
+    freezoneRelations: [{
+      id: '0:1',
+      sideA: 0,
+      sideB: 1,
+      status: 'ally',
+      updatedBy: 1,
+      updatedAt: 12
+    }],
+    freezoneAllianceInvitations: [{
+      ...base.freezoneAllianceInvitations[0],
+      status: 'accepted',
+      updatedAt: 12
+    }]
+  };
+  const current = {
+    ...base,
+    freezoneRelations: [{
+      sideA: 1,
+      sideB: 0,
+      status: 'enemy',
+      updatedBy: 0,
+      updatedAt: 11
+    }],
+    freezoneAllianceInvitations: [
+      base.freezoneAllianceInvitations[0],
+      {
+        id: 'duplicate-invite',
+        fromSide: 1,
+        toSide: 0,
+        status: 'pending',
+        createdAt: 11,
+        updatedAt: 11
+      }
+    ]
+  };
+  const merged = mergeFreezoneRoomState(base, local, current);
+  assert.equal(merged.freezoneRelations.length, 1);
+  assert.equal(merged.freezoneRelations[0].status, 'ally');
+  assert.equal(merged.freezoneAllianceInvitations.find(({ id }) => id === 'invite-1').status, 'accepted');
+  assert.equal(
+    normalizeFreezoneAllianceInvitations(merged.freezoneAllianceInvitations)
+      .filter(({ status }) => status === 'pending').length,
+    0
+  );
+  assert.deepEqual(normalizeFreezoneRelations([
+    { sideA: 3, sideB: 1, status: 'neutral', updatedAt: 4 },
+    { sideA: 1, sideB: 3, status: 'ally', updatedAt: 5 },
+    { sideA: 1, sideB: 1, status: 'enemy', updatedAt: 9 }
+  ]), [{
+    id: '1:3',
+    sideA: 1,
+    sideB: 3,
+    status: 'ally',
+    updatedAt: 5,
+    updatedBy: 1
+  }]);
 });
 
 test('Freezone eliminations increment once and retain ties for the leaders display', () => {
@@ -1092,10 +1599,29 @@ test('Freezone player leaderboard includes active players with zero eliminations
 test('Freezone reconnect grace starts when presence detects departure, not stale last-seen time', () => {
   const now = 1_000_000;
   const active = {
-    seats: [{ token: 'player-0', name: 'Ari', lastSeenAt: now - 10 * FREEZONE_RECONNECT_GRACE_MS }],
+    seats: [
+      { token: 'player-0', name: 'Ari', lastSeenAt: now - 10 * FREEZONE_RECONNECT_GRACE_MS },
+      { token: 'player-1', name: 'Bia' }
+    ],
     pieces: [{ id: 'king-0', side: 0, r: 4, c: 4 }],
     freezonePlayers: { 0: { xp: 7, orbBalances: { xp: 3 } } },
     freezoneDepartures: {},
+    freezoneRelations: [{
+      id: '0:1',
+      sideA: 0,
+      sideB: 1,
+      status: 'ally',
+      updatedBy: 1,
+      updatedAt: now - 100
+    }],
+    freezoneAllianceInvitations: [{
+      id: 'invite-pending',
+      fromSide: 1,
+      toSide: 0,
+      status: 'pending',
+      createdAt: now - 100,
+      updatedAt: now - 100
+    }],
     eliminationRecords: [{ id: 'piece-0', side: 0, eliminations: 2 }],
     eliminatedSeats: []
   };
@@ -1115,12 +1641,16 @@ test('Freezone reconnect grace starts when presence detects departure, not stale
   );
   assert.deepEqual(reconnected.pieces, active.pieces);
   assert.deepEqual(reconnected.freezonePlayers[0], active.freezonePlayers[0]);
+  assert.deepEqual(reconnected.freezoneRelations, active.freezoneRelations);
+  assert.deepEqual(reconnected.freezoneAllianceInvitations, active.freezoneAllianceInvitations);
   assert.equal(reconnected.freezoneDepartures['player-0'], undefined);
 
   const expired = expireFreezoneSessions(departed, now + FREEZONE_RECONNECT_GRACE_MS);
   assert.equal(expired.seats[0], null);
   assert.deepEqual(expired.pieces, []);
   assert.equal(expired.freezonePlayers[0], undefined);
+  assert.deepEqual(expired.freezoneRelations, []);
+  assert.deepEqual(expired.freezoneAllianceInvitations, []);
   assert.equal(expired.eliminationRecords.length, 0);
 });
 
@@ -1166,12 +1696,18 @@ test('Freezone presence and AI controls are wired with bots disabled by default'
   assert.ok(engine.includes('botsEnabled: false'));
   assert.ok(engine.includes('setFreezoneBotsEnabled,'));
   assert.ok(engine.includes('async function buyFreezoneAlly(role, requestedName = \'\')'));
+  assert.ok(engine.includes('async function setFreezoneTeamRelation(targetSide, action, invitationId = \'\')'));
+  assert.ok(engine.includes('freezoneBotLastActionOrder.get(`side:${left.side}`)'));
   assert.ok(engine.includes('chooseFreezoneAllyMove'));
   assert.ok(panel.includes('Recruit a robot'));
   assert.ok(panel.includes('className="freezone-hud-bots"'));
   assert.ok(engine.includes('let freezoneAIAssistEnabled = false;'));
   assert.ok(panel.includes("readLocalSetting('freezone-ai-assist-enabled') === 'true'"));
   assert.ok(panel.includes('Player elimination ranking'));
+  assert.ok(panel.includes('Invite to alliance'));
+  assert.ok(panel.includes('Accept alliance'));
+  assert.ok(panel.includes('Declare mortal enemy'));
+  assert.ok(panel.includes('Respond in the room ranking panel.'));
   assert.ok(multiplayer.includes(".on('presence', { event: 'join' }, publishPresence)"));
   assert.ok(multiplayer.includes(".on('presence', { event: 'leave' }, publishPresence)"));
   assert.ok(multiplayer.includes('getFreezoneSeatOccupancy'));
@@ -1214,6 +1750,9 @@ test('Freezone adversary bots default off, fill no more than two free seats, and
   assert.equal(enabled.state.seats.filter((seat) => seat?.bot).length, 2);
   assert.deepEqual(enabled.state.seats.slice(0, 2), initial.seats.slice(0, 2));
   assert.equal(enabled.addedSides.length, 2);
+  const syncedEnabled = mergeFreezoneRoomState(initial, enabled.state, initial);
+  assert.equal(syncedEnabled.botsEnabled, true);
+  assert.equal(syncedEnabled.seats.filter((seat) => seat?.bot).length, 2);
 
   const toggledOnAgain = configureFreezoneBots(enabled.state, true, 'ROOM');
   assert.equal(toggledOnAgain.addedSides.length, 0);
@@ -1227,6 +1766,74 @@ test('Freezone adversary bots default off, fill no more than two free seats, and
   assert.deepEqual(turnedOff.state.freezonePlayers, initial.freezonePlayers);
   assert.deepEqual(turnedOff.state.freezonePlayers[0].allies, initial.freezonePlayers[0].allies);
   assert.equal(turnedOff.state.seats.some((seat) => seat?.bot), false);
+
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const toggleStart = engine.indexOf('async function setFreezoneBotsEnabled');
+  const toggleEnd = engine.indexOf('function scheduleFreezoneBotAction', toggleStart);
+  const toggle = engine.slice(toggleStart, toggleEnd);
+  assert.ok(toggle.includes('const previousState = serializeFreeModeState();'));
+  assert.ok(toggle.includes('persistFreeModeState(previousState)'));
+  assert.ok(engine.includes('const existingArmy = Array.from(freePieces.values())'));
+  assert.ok(engine.includes('if (!existingArmy.some((piece) => piece.type === \'king\'))'));
+  assert.ok(engine.includes('if (customSeats[side]) customSeats[side] = { ...customSeats[side], needsArmy: false };'));
+});
+
+test('Freezone presence removes orphan and offline armies, and only retains enabled bot armies', () => {
+  const now = 1_800_000_000_000;
+  const state = {
+    botsEnabled: false,
+    seats: [
+      { token: 'online-player', name: 'Online', lastSeenAt: now },
+      { token: 'offline-player', name: 'Offline', lastSeenAt: now },
+      { token: 'legacy-bot', name: 'Legacy bot', bot: true },
+      null
+    ],
+    pieces: [
+      { id: 'online-piece', side: 0 },
+      { id: 'offline-piece', side: 1 },
+      { id: 'disabled-bot-piece', side: 2 },
+      { id: 'orphan-piece', side: 3 }
+    ],
+    freezonePlayers: { 0: { xp: 1 }, 1: { xp: 2 }, 2: { xp: 3 } },
+    eliminationRecords: [],
+    eliminatedSeats: [],
+    orbClaims: []
+  };
+  const reconciled = reconcileFreezonePresence(
+    state,
+    [{ token: 'online-player' }],
+    now
+  );
+  assert.deepEqual(reconciled.pieces.map(({ id }) => id), ['online-piece']);
+  assert.deepEqual(reconciled.freezoneDepartures['offline-player'].pieces, [
+    { id: 'offline-piece', side: 1 }
+  ]);
+  assert.equal(reconciled.seats[2], null);
+  assert.equal(reconciled.botsEnabled, false);
+
+  const botsEnabled = reconcileFreezonePresence({
+    ...state,
+    botsEnabled: true,
+    seats: [state.seats[0], { token: 'bot:room:1', name: 'AI Bot 2', bot: true }],
+    pieces: [{ id: 'online-piece', side: 0 }, { id: 'enabled-bot-piece', side: 1 }]
+  }, [{ token: 'online-player' }], now);
+  assert.deepEqual(
+    botsEnabled.pieces.map(({ id }) => id),
+    ['online-piece', 'enabled-bot-piece']
+  );
+});
+
+test('Freezone allied and adversary bots use a 6–9 second movement interval', () => {
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  assert.equal(getFreezoneBotMoveDelay(() => 0), 6000);
+  assert.equal(getFreezoneBotMoveDelay(() => 0.5), 7500);
+  assert.equal(getFreezoneBotMoveDelay(() => 1), 9000);
+  assert.ok(engine.includes('freezoneBotNextActionAt = now + getFreezoneBotMoveDelay()'));
+  assert.equal(
+    (engine.match(/freezoneBotNextActionAt = Date\.now\(\) \+ getFreezoneBotMoveDelay\(\)/g) || []).length,
+    2
+  );
+  assert.ok(engine.includes('freezoneBotNextActionAt - now'));
 });
 
 test('Freezone bot removal survives room merge and removes the bot avatar state', () => {
@@ -1771,12 +2378,55 @@ test('Freezone shop stays open through repeated HUD updates', () => {
   assert.ok(panel.includes("['resources', 'Resources']"));
   assert.ok(panel.includes("['profile', 'My profile']"));
   assert.ok(panel.includes('window.speechSynthesis.speak(utterance)'));
-  assert.ok(panel.includes('Enable local speech for piece voice lines on this device'));
+  assert.ok(panel.includes('Enable local browser speech for custom piece phrases'));
+  const myBotsStart = panel.indexOf('aria-label="My bots and units"');
+  const myBotsEnd = panel.indexOf('aria-label="Your resources"', myBotsStart);
+  assert.ok(!panel.slice(myBotsStart, myBotsEnd).includes('Enable local browser speech'));
   assert.ok(panel.includes('Text bubbles can appear while speech is off.'));
   assert.ok(panel.includes('Unit profile updated without a purchase.'));
   assert.ok(styles.includes('.freezone-shop-nav'));
   assert.ok(styles.includes('@media (max-width: 420px)'));
   assert.ok(styles.includes('.freezone-piece-cooldowns'));
+});
+
+test('Freezone quick spheres guide a new army through identity and celebration without a movement editor', () => {
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+  const acquisitionStart = panel.indexOf('const acquirePiece = async');
+  const acquisitionEnd = panel.indexOf('const emitTeamVoiceEvent =', acquisitionStart);
+  const acquisition = panel.slice(acquisitionStart, acquisitionEnd);
+
+  assert.ok(panel.includes('aria-label="Freezone upgrade spheres"'));
+  assert.ok(panel.includes("onClick={() => setUpgradeModalStage('army-unlocked')}"));
+  assert.ok(panel.includes('Victory phrase'));
+  assert.ok(panel.includes('onClick={acquireSelectedPattern}'));
+  assert.ok(panel.includes('Create piece · {hud.xpCost} XP'));
+  assert.ok(panel.includes("upgradeModalStage === 'army-replacement'"));
+  assert.ok(!panel.includes('piece-movement'));
+  assert.ok(acquisition.indexOf("setUpgradeModalStage('army-celebration')") >
+    acquisition.indexOf('if (result.ok)'));
+  assert.ok(panel.includes('freezone-army-confetti'));
+  assert.ok(styles.includes('.freezone-quick-upgrade-grid'));
+  assert.ok(styles.includes('@keyframes freezone-army-confetti-fall'));
+});
+
+test('Freezone voice lines have individual previews and movement can use a local fallback', () => {
+  const panel = fs.readFileSync(path.join(ROOT, 'src/FreezonePanel.tsx'), 'utf-8');
+  const engine = fs.readFileSync(path.join(ROOT, 'src/wizardChessEngine.js'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
+
+  assert.equal((panel.match(/aria-label=\{`Preview \$\{event\.label\} voice line`\}/g) || []).length, 2);
+  assert.equal((panel.match(/previewPieceVoiceLine\(voiceLines\[event\.id as VoiceEventKey\]\)/g) || []).length, 2);
+  assert.ok(panel.includes("setStatus('Starting local phrase preview…')"));
+  assert.ok(panel.includes('if (window.speechSynthesis.speaking || window.speechSynthesis.pending)'));
+  assert.ok(panel.includes('Movement source'));
+  assert.ok(panel.includes('<option value="local">Local fallback · no API</option>'));
+  assert.ok(panel.includes("window.localStorage.setItem('freezone-ai-movement-mode', aiMovementMode)"));
+  assert.ok(panel.includes("detail: aiMovementMode"));
+  assert.ok(engine.includes("freezoneAIMovementMode === 'local'"));
+  assert.ok(engine.includes("window.addEventListener('wizard-chess-freezone-ai-movement-mode'"));
+  assert.ok(engine.includes('const cooldown = eventKey === \'vulnerable\' ? 15000'));
+  assert.ok(styles.includes('.freezone-voice-preview'));
 });
 
 test('Freezone selection persists for repeat moves and entry camera focuses the player team', () => {
@@ -1834,9 +2484,13 @@ test('Freezone AI controls stay visible and manual movement resumes after cooldo
   assert.ok(aiRequest.includes('if (!moveStarted)'));
   assert.ok(engine.includes('function scheduleFreezoneAIAnimationRetry'));
   assert.ok(engine.includes('detail: `AI text: ${generatedText}`'));
-  assert.ok(engine.includes('new THREE.CircleGeometry(freeModeActive ? 0.15 : 0.06, 24)'));
-  assert.ok(engine.includes('new THREE.RingGeometry(0.27, 0.34, 32)'));
-  assert.ok(engine.includes('depthTest: !freeModeActive'));
+  assert.ok(engine.includes('new THREE.CircleGeometry(freeModeActive ? 0.08 : 0.06, 24)'));
+  assert.ok(engine.includes('new THREE.RingGeometry(0.22, 0.27, 32)'));
+  const highlightsStart = engine.indexOf('function showSquareHighlights(r, c, moves)');
+  const highlightsEnd = engine.indexOf('// Stone Shatter Debris Physics', highlightsStart);
+  const highlights = engine.slice(highlightsStart, highlightsEnd);
+  assert.ok(highlights.includes('depthTest: true'));
+  assert.ok(!highlights.includes('depthTest: false'));
   assert.ok(engine.includes("cancelPendingFreezoneAIRequest('army')"));
   assert.ok(engine.includes('scheduleFreezoneAIIdleAction(protectedPiece.freeId, null)'));
   assert.ok(engine.includes("const label = aiControlled ? `AI · ${name}` : name;"));

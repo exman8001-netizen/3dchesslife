@@ -2,6 +2,12 @@ import { useEffect, useRef, useState } from 'react';
 import { initWizardChess } from './wizardChessEngine.js';
 import ModeCreator, { type CustomGameMode } from './ModeCreator';
 import FreezonePanel, { type FreezonePattern } from './FreezonePanel';
+import {
+  DISPLAY_PREFERENCES_STORAGE_KEY,
+  loadDisplayPreferences,
+  type DisplayPreferenceKey,
+  type DisplayPreferences
+} from './displayPreferences';
 
 type MultiplayerResult = { ok: boolean; code?: string; error?: string };
 type RoomState = { code: string; whiteJoined: boolean; blackJoined: boolean };
@@ -15,9 +21,41 @@ type CreatorRoom = {
 };
 type FreezoneUpgrade = 'red' | 'blue' | 'yellow' | 'purple' | 'white';
 type FreezonePurchaseOrb = 'red' | 'blue' | 'yellow' | 'purple' | 'white' | 'movement';
+type FreezoneUpgradePayment = 'orb' | 'xp';
 type FreezoneAllyRole = 'strategic' | 'offensive' | 'defensive' | 'guardian' | 'collector';
+type FreezoneRelationAction = 'invite' | 'accept' | 'decline' | 'enemy' | 'neutral';
 type MultiplayerAction = () => Promise<MultiplayerResult> | undefined;
+const DISPLAY_PREFERENCE_GROUPS: Array<{
+  title: string;
+  items: Array<{ key: DisplayPreferenceKey; label: string }>;
+}> = [
+  {
+    title: 'Main menu',
+    items: [
+      { key: 'menuMultiplayer', label: 'Show Multiplayer' },
+      { key: 'menuTestMode', label: 'Show Test Mode' },
+      { key: 'menuFreeMode', label: 'Show Free Mode' },
+      { key: 'menuModeCreator', label: 'Show Mode Creator' }
+    ]
+  },
+  {
+    title: 'Freezone screen',
+    items: [
+      { key: 'freezoneStats', label: 'Show XP, army and orb totals' },
+      { key: 'freezonePlayer', label: 'Show player name and selected piece' },
+      { key: 'freezoneTurnStatus', label: 'Show turn status (White to Move / Playing as White)' },
+      { key: 'freezoneOnlineRoster', label: 'Show online players list' },
+      { key: 'freezoneAdversaryBots', label: 'Show adversary bot switch' },
+      { key: 'freezoneReturnMenu', label: 'Show return-to-menu button' },
+      { key: 'freezoneCamera', label: 'Show camera controls' },
+      { key: 'freezoneRadio', label: 'Show radio button' },
+      { key: 'freezonePieceShop', label: 'Show Piece Shop button' }
+    ]
+  }
+];
+
 type MultiplayerApi = {
+  toggleUI?: (forceHidden?: boolean) => boolean;
   createMultiplayerRoom?: (color: 'w' | 'b') => Promise<MultiplayerResult>;
   joinMultiplayerRoom?: (code: string) => Promise<MultiplayerResult>;
   quickMatch?: () => Promise<MultiplayerResult>;
@@ -37,10 +75,18 @@ type MultiplayerApi = {
   updateFreezonePieceProfile?: (
     pieceId: string,
     profile: Pick<FreezonePattern, 'name' | 'title' | 'catchphrase' | 'appearance' |
-      'description' | 'personality' | 'language' | 'aiVoice' | 'voiceLines'>
+      'description' | 'personality' | 'language' | 'aiVoice' | 'qwenVoice' |
+      'kokoroVoice' | 'voiceLines'>
   ) => Promise<{ ok: boolean; error?: string }>;
-  upgradeFreezoneSkill?: (type: FreezoneUpgrade) => Promise<{ ok: boolean; error?: string }>;
-  upgradeFreezoneEnvelope?: (rows: number, cols: number) => Promise<{ ok: boolean; error?: string }>;
+  upgradeFreezoneSkill?: (
+    type: FreezoneUpgrade,
+    payment?: FreezoneUpgradePayment
+  ) => Promise<{ ok: boolean; error?: string }>;
+  upgradeFreezoneEnvelope?: (
+    rows: number,
+    cols: number,
+    payment?: FreezoneUpgradePayment
+  ) => Promise<{ ok: boolean; error?: string }>;
   unlockFreezoneMovement?: (
     pieceId: string,
     row: number,
@@ -48,9 +94,15 @@ type MultiplayerApi = {
     kind: 'drag' | 'jump' | 'teleport',
     scopeRows: number,
     scopeCols: number,
-    targetA: number
+    targetA: number,
+    payment?: FreezoneUpgradePayment
   ) => Promise<{ ok: boolean; error?: string; addedOffset?: boolean }>;
   setFreezoneBotsEnabled?: (enabled: boolean) => Promise<{ ok: boolean; error?: string }>;
+  setFreezoneTeamRelation?: (
+    targetSide: number,
+    action: FreezoneRelationAction,
+    invitationId?: string
+  ) => Promise<{ ok: boolean; error?: string }>;
   setFreezoneSharedMusicUrl?: (url: string) => Promise<{ ok: boolean; error?: string }>;
   setFreezoneSharedMusicPlaying?: (playing: boolean) => Promise<{ ok: boolean; error?: string }>;
   leaveCurrentGame?: () => void;
@@ -62,9 +114,28 @@ declare global {
   }
 }
 
+const localMusicFiles = import.meta.glob<string>(
+  '../music/*.{mp3,ogg,wav,m4a,aac}',
+  { eager: true, query: '?url', import: 'default' }
+);
+const localMusicTracks = Object.entries(localMusicFiles)
+  .sort(([left], [right]) => left.localeCompare(right));
+const introMusic = localMusicTracks.find(([path]) => /brass sabers/i.test(path))?.[1]
+  || localMusicTracks[0]?.[1]
+  || '';
+const gameplayMusicPlaylist = localMusicTracks.map(([, url]) => url);
+
 export default function App() {
   const initializedRef = useRef(false);
+  const backgroundMusicRef = useRef<HTMLAudioElement>(null);
   const [mainMenuOpen, setMainMenuOpen] = useState(true);
+  const [displaySettingsLoad] = useState(loadDisplayPreferences);
+  const [displayPreferences, setDisplayPreferences] = useState<DisplayPreferences>(
+    displaySettingsLoad.preferences
+  );
+  const [displaySettingsWarning, setDisplaySettingsWarning] = useState(displaySettingsLoad.warning);
+  const [displaySettingsOpen, setDisplaySettingsOpen] = useState(false);
+  const [freezoneActive, setFreezoneActive] = useState(false);
   const [mobileSheetOpen, setMobileSheetOpen] = useState(false);
   const [multiplayerOpen, setMultiplayerOpen] = useState(
     () => Boolean(new URLSearchParams(window.location.search).get('room'))
@@ -84,6 +155,69 @@ export default function App() {
     initializedRef.current = true;
     initWizardChess();
   }, []);
+
+  useEffect(() => {
+    const audio = backgroundMusicRef.current;
+    if (!audio) return undefined;
+
+    const tracks = mainMenuOpen
+      ? introMusic ? [introMusic] : []
+      : freezoneActive ? [] : gameplayMusicPlaylist;
+    if (!tracks.length) {
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+      return undefined;
+    }
+
+    let trackIndex = 0;
+    const playCurrentTrack = () => {
+      audio.volume = 0.32;
+      void audio.play().catch((error: unknown) => {
+        if (error instanceof DOMException &&
+            (error.name === 'NotAllowedError' || error.name === 'AbortError')) return;
+        console.warn('Could not play background music.', error);
+      });
+    };
+    const handleTrackEnded = () => {
+      if (tracks.length < 2) return;
+      trackIndex = (trackIndex + 1) % tracks.length;
+      audio.src = tracks[trackIndex];
+      audio.load();
+      playCurrentTrack();
+    };
+    const resumeAfterInteraction = () => {
+      if (audio.paused) playCurrentTrack();
+    };
+
+    audio.preload = 'auto';
+    audio.loop = tracks.length === 1;
+    audio.src = tracks[trackIndex];
+    audio.load();
+    audio.addEventListener('ended', handleTrackEnded);
+    document.addEventListener('pointerdown', resumeAfterInteraction);
+    document.addEventListener('keydown', resumeAfterInteraction);
+    playCurrentTrack();
+
+    return () => {
+      audio.removeEventListener('ended', handleTrackEnded);
+      document.removeEventListener('pointerdown', resumeAfterInteraction);
+      document.removeEventListener('keydown', resumeAfterInteraction);
+      audio.pause();
+      audio.removeAttribute('src');
+      audio.load();
+    };
+  }, [mainMenuOpen, freezoneActive]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(DISPLAY_PREFERENCES_STORAGE_KEY, JSON.stringify(displayPreferences));
+      setDisplaySettingsWarning('');
+    } catch (error) {
+      console.warn('Could not save display settings.', error);
+      setDisplaySettingsWarning('Display settings could not be saved in this browser.');
+    }
+  }, [displayPreferences]);
 
   useEffect(() => {
     if (!multiplayerOpen) return;
@@ -111,6 +245,7 @@ export default function App() {
       if (e.key === 'Escape') {
         setMobileSheetOpen(false);
         setMultiplayerOpen(false);
+        setDisplaySettingsOpen(false);
       }
     };
     const handleResize = () => {
@@ -150,6 +285,7 @@ export default function App() {
     };
     const handleFreezoneState = (event: Event) => {
       const state = (event as CustomEvent<{ enabled?: boolean }>).detail;
+      if (typeof state?.enabled === 'boolean') setFreezoneActive(state.enabled);
       if (state?.enabled) {
         setMainMenuOpen(false);
         setMultiplayerOpen(false);
@@ -216,6 +352,7 @@ export default function App() {
     setMultiplayerOpen(false);
     setModeCreatorOpen(false);
     setMainMenuOpen(true);
+    setFreezoneActive(false);
     setRoomCode('');
     setMultiplayerStatus('');
     const leaveCurrentGame = window.wizardChess?.leaveCurrentGame;
@@ -227,21 +364,39 @@ export default function App() {
   };
 
   const handleRestoreUI = () => {
-    const win = window as unknown as { wizardChess?: { toggleUI?: (force?: boolean) => void } };
-    if (win.wizardChess?.toggleUI) {
-      win.wizardChess.toggleUI(false);
+    if (window.wizardChess?.toggleUI) {
+      window.wizardChess.toggleUI(false);
     } else {
       document.body.classList.remove('cinematic-ui-hidden');
       const btnHide = document.getElementById('btn-hide-ui');
       if (btnHide) {
-        btnHide.setAttribute('aria-label', 'Hide HUD controls');
-        btnHide.title = 'Hide HUD controls (Shortcut: H)';
+        btnHide.setAttribute('aria-label', 'Hide all game UI');
+        btnHide.title = 'Hide all game UI (Shortcut: H)';
       }
     }
   };
 
+  const handleHideUI = () => {
+    setMobileSheetOpen(false);
+    if (window.wizardChess?.toggleUI) {
+      window.wizardChess.toggleUI(true);
+    } else {
+      document.body.classList.add('cinematic-ui-hidden');
+      const btnHide = document.getElementById('btn-hide-ui');
+      if (btnHide) {
+        btnHide.setAttribute('aria-label', 'Show all game UI');
+        btnHide.title = 'Show all game UI (Shortcut: H)';
+      }
+    }
+  };
+
+  const toggleDisplayPreference = (key: DisplayPreferenceKey) => {
+    setDisplayPreferences((current) => ({ ...current, [key]: !current[key] }));
+  };
+
   return (
     <>
+      <audio ref={backgroundMusicRef} preload="auto" aria-hidden="true" />
       <div id="loading-overlay">
         <div className="loader-title">Wizard Chess</div>
         <div className="loader-bar-wrap">
@@ -257,8 +412,8 @@ export default function App() {
         className="hud-btn ui-restore-btn hud-icon-button"
         id="btn-mobile-show-ui"
         onClick={handleRestoreUI}
-        aria-label="Show HUD controls"
-        title="Show HUD Controls"
+        aria-label="Show all game UI"
+        title="Show all game UI"
       >
         <svg viewBox="0 0 24 24" aria-hidden="true">
           <path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z" />
@@ -267,7 +422,11 @@ export default function App() {
       </button>
 
       <div id="hud-top">
-        <div className="hud-group" id="hud-left">
+        <div
+          className="hud-group"
+          id="hud-left"
+          style={{ display: freezoneActive && !displayPreferences.freezoneTurnStatus ? 'none' : undefined }}
+        >
           <div className="status-pill" id="status-pill">
             <span className="turn-dot" id="turn-dot"></span>
             <span id="turn-text">White to Move</span>
@@ -275,7 +434,7 @@ export default function App() {
           </div>
         </div>
 
-        {!mainMenuOpen && (
+        {!mainMenuOpen && (!freezoneActive || displayPreferences.freezoneReturnMenu) && (
           <button
             type="button"
             className="hud-btn return-menu-btn hud-icon-button"
@@ -380,26 +539,28 @@ export default function App() {
           <div className="hud-divider" aria-hidden="true"></div>
           <div className="mobile-sheet-section-label">Camera Views</div>
 
-          <div className="camera-preset-group" aria-label="Camera controls">
-            <label className="camera-preset-label" htmlFor="camera-preset-select" aria-label="Camera">
-              <svg viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M3 7h3l1.5-2h9L18 7h3v12H3V7Z" />
-                <circle cx="12" cy="13" r="3.5" />
-              </svg>
-            </label>
-            <select
-              className="hud-btn camera-preset-select"
-              id="camera-preset-select"
-              aria-label="Choose camera view"
-              defaultValue="player"
-            >
-              <option value="custom" disabled>Custom view</option>
-              <option value="player">Player Cam</option>
-              <option value="top">Overhead</option>
-              <option value="side">Side</option>
-              <option value="wide">Cathedral</option>
-            </select>
-          </div>
+          {(!freezoneActive || displayPreferences.freezoneCamera) && (
+            <div className="camera-preset-group" aria-label="Camera controls">
+              <label className="camera-preset-label" htmlFor="camera-preset-select" aria-label="Camera">
+                <svg viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M3 7h3l1.5-2h9L18 7h3v12H3V7Z" />
+                  <circle cx="12" cy="13" r="3.5" />
+                </svg>
+              </label>
+              <select
+                className="hud-btn camera-preset-select"
+                id="camera-preset-select"
+                aria-label="Choose camera view"
+                defaultValue="player"
+              >
+                <option value="custom" disabled>Custom view</option>
+                <option value="player">Player Cam</option>
+                <option value="top">Overhead</option>
+                <option value="side">Side</option>
+                <option value="wide">Cathedral</option>
+              </select>
+            </div>
+          )}
 
           <div className="hud-divider" aria-hidden="true"></div>
           <div className="mobile-sheet-section-label">Display &amp; Gestures</div>
@@ -407,9 +568,9 @@ export default function App() {
           <button
             className="hud-btn"
             id="btn-hide-ui"
-            title="Hide HUD controls (Shortcut: H)"
-            aria-label="Hide HUD controls"
-            onClick={() => setMobileSheetOpen(false)}
+            title="Hide all game UI (Shortcut: H)"
+            aria-label="Hide all game UI"
+            onClick={handleHideUI}
           >
             <svg viewBox="0 0 24 24" aria-hidden="true">
               <path d="M2.5 12s3.5-6.5 9.5-6.5 9.5 6.5 9.5 6.5-3.5 6.5-9.5 6.5S2.5 12 2.5 12Z" />
@@ -435,17 +596,26 @@ export default function App() {
           <p className="main-menu-eyebrow">SANCTUM · CHOOSE YOUR GAME</p>
           <h1 id="main-menu-title">Wizard Chess</h1>
           <p className="main-menu-description">Choose how you want to play.</p>
+          <button
+            type="button"
+            className="display-settings-open"
+            onClick={() => setDisplaySettingsOpen(true)}
+          >
+            ⚙ Display settings
+          </button>
           <div className="main-menu-actions">
-            <button
-              type="button"
-              className="main-menu-choice primary"
-              onClick={() => {
-                setMultiplayerStatus('');
-                setMultiplayerOpen(true);
-              }}
-            >
-              Multiplayer
-            </button>
+            {displayPreferences.menuMultiplayer && (
+              <button
+                type="button"
+                className="main-menu-choice primary"
+                onClick={() => {
+                  setMultiplayerStatus('');
+                  setMultiplayerOpen(true);
+                }}
+              >
+                Multiplayer
+              </button>
+            )}
             <button
               type="button"
               className="main-menu-choice"
@@ -453,34 +623,40 @@ export default function App() {
             >
               Freezone
             </button>
-            <button
-              type="button"
-              className="main-menu-choice"
-              id="btn-reset"
-              onClick={() => {
-                setMultiplayerStatus('');
-                setMainMenuOpen(false);
-              }}
-            >
-              Test Mode
-            </button>
-            <button
-              type="button"
-              className="main-menu-choice free-mode-toggle"
-              onClick={() => {
-                setMultiplayerStatus('');
-                setMainMenuOpen(false);
-              }}
-            >
-              Free Mode
-            </button>
-            <button
-              type="button"
-              className="main-menu-choice"
-              onClick={() => setModeCreatorOpen(true)}
-            >
-              Mode Creator
-            </button>
+            {displayPreferences.menuTestMode && (
+              <button
+                type="button"
+                className="main-menu-choice"
+                id="btn-reset"
+                onClick={() => {
+                  setMultiplayerStatus('');
+                  setMainMenuOpen(false);
+                }}
+              >
+                Test Mode
+              </button>
+            )}
+            {displayPreferences.menuFreeMode && (
+              <button
+                type="button"
+                className="main-menu-choice free-mode-toggle"
+                onClick={() => {
+                  setMultiplayerStatus('');
+                  setMainMenuOpen(false);
+                }}
+              >
+                Free Mode
+              </button>
+            )}
+            {displayPreferences.menuModeCreator && (
+              <button
+                type="button"
+                className="main-menu-choice"
+                onClick={() => setModeCreatorOpen(true)}
+              >
+                Mode Creator
+              </button>
+            )}
           </div>
           {multiplayerStatus && (
             <p className="main-menu-status" aria-live="polite">{multiplayerStatus}</p>
@@ -488,7 +664,70 @@ export default function App() {
         </section>
       </div>
 
-      <FreezonePanel mainMenuOpen={mainMenuOpen} />
+      <FreezonePanel
+        mainMenuOpen={mainMenuOpen}
+        displayPreferences={displayPreferences}
+        onOpenDisplaySettings={() => setDisplaySettingsOpen(true)}
+      />
+
+      <div
+        className={`display-settings-overlay ${displaySettingsOpen ? 'open' : ''}`}
+        aria-hidden={!displaySettingsOpen}
+        onClick={() => setDisplaySettingsOpen(false)}
+      >
+        <section
+          className="display-settings-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="display-settings-title"
+          onClick={(event) => event.stopPropagation()}
+        >
+          <header className="display-settings-header">
+            <div>
+              <p className="main-menu-eyebrow">SCREEN CONTROLS</p>
+              <h2 id="display-settings-title">Display settings</h2>
+            </div>
+            <button
+              type="button"
+              className="display-settings-close"
+              aria-label="Close display settings"
+              onClick={() => setDisplaySettingsOpen(false)}
+            >
+              ×
+            </button>
+          </header>
+          <p className="display-settings-description">
+            Choose which buttons and information to show. These preferences are saved on this device.
+          </p>
+          <div className="display-settings-groups">
+            {DISPLAY_PREFERENCE_GROUPS.map((group) => (
+              <fieldset key={group.title} className="display-settings-group">
+                <legend>{group.title}</legend>
+                {group.items.map((item) => (
+                  <label key={item.key} className="display-settings-option">
+                    <input
+                      type="checkbox"
+                      checked={displayPreferences[item.key]}
+                      onChange={() => toggleDisplayPreference(item.key)}
+                    />
+                    <span>{item.label}</span>
+                  </label>
+                ))}
+              </fieldset>
+            ))}
+          </div>
+          {displaySettingsWarning && (
+            <p className="display-settings-warning" role="status">{displaySettingsWarning}</p>
+          )}
+          <button
+            type="button"
+            className="display-settings-done"
+            onClick={() => setDisplaySettingsOpen(false)}
+          >
+            Done
+          </button>
+        </section>
+      </div>
 
       <div
         className={`multiplayer-overlay ${multiplayerOpen ? 'open' : ''}`}

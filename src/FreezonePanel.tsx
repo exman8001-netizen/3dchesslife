@@ -1,8 +1,12 @@
 import { useEffect, useRef, useState, type FormEvent } from 'react';
 import FreezoneAppearancePreview from './FreezoneAppearancePreview';
+import type { DisplayPreferences } from './displayPreferences';
 import {
   FREEZONE_AI_LANGUAGES,
   FREEZONE_AI_VOICES,
+  FREEZONE_KOKORO_BROWSER_VOICE_IDS,
+  FREEZONE_KOKORO_VOICES,
+  FREEZONE_QWEN_VOICES,
   FREEZONE_APPEARANCES,
   FREEZONE_VOICE_EVENTS,
   formatFreezoneSessionAge,
@@ -19,8 +23,13 @@ import {
 import {
   clearFreezoneAIKeys,
   getFreezoneAISettings,
+  getFreezoneAIRequestSettings,
   updateFreezoneAISettings
 } from './freezoneAISettings.js';
+import {
+  generateFreezoneKokoroSpeech,
+  preloadFreezoneKokoroSpeech
+} from './freezoneKokoro.js';
 import {
   FREEZONE_ENVELOPE_ORB_COST,
   FREEZONE_ENVELOPE_OPTIONS,
@@ -45,7 +54,8 @@ type VoiceEventKey =
   | 'inactivity' | 'inspection' | 'victory' | 'defeat' | 'vulnerable';
 type PieceVoiceLines = Record<VoiceEventKey, string>;
 type FreezoneTextProvider = 'openrouter' | 'gemini' | 'openai' | 'deepseek';
-type FreezoneSpeechProvider = 'gemini-live' | 'gemini-tts' | 'openai-tts' | 'google-tts';
+type FreezoneSpeechProvider =
+  | 'gemini-live' | 'gemini-tts' | 'openai-tts' | 'google-tts' | 'qwen3-tts' | 'kokoro';
 
 type FreezoneRoom = {
   id: string;
@@ -78,6 +88,8 @@ export type FreezonePattern = {
   personality: string;
   language: string;
   aiVoice: string;
+  qwenVoice: string;
+  kokoroVoice: string;
   voiceLines: PieceVoiceLines;
   type: PieceType;
   moves: MoveOffset[];
@@ -95,6 +107,8 @@ type FreezoneOwnedPiece = {
   personality: string;
   language: string;
   aiVoice: string;
+  qwenVoice: string;
+  kokoroVoice: string;
   appearance: string;
   eliminations: number;
   moves: MoveOffset[];
@@ -110,6 +124,31 @@ type FreezoneInspectedPiece = FreezoneOwnedPiece & {
   side: number;
   x: number;
   y: number;
+};
+type FreezoneRelation = {
+  id: string;
+  sideA: number;
+  sideB: number;
+  status: 'ally' | 'enemy' | 'neutral';
+  updatedAt: number;
+  updatedBy: number;
+};
+type FreezoneTeamPiece = {
+  id: string;
+  name: string;
+  type: FreezoneOwnedPiece['type'];
+  ally: boolean;
+  cooldownDurationMs: number;
+  readyAt: number;
+  cooldownMs: number;
+};
+type FreezoneAllianceInvitation = {
+  id: string;
+  fromSide: number;
+  toSide: number;
+  status: 'pending' | 'accepted' | 'declined' | 'cancelled';
+  createdAt: number;
+  updatedAt: number;
 };
 type FreezoneSpeechBubble = { text: string; x: number; y: number };
 
@@ -140,6 +179,13 @@ type FreezoneRoomRankingEntry = FreezoneOnlinePlayer & {
   position: number;
   leader: boolean;
   crown: boolean;
+};
+const freezoneRankingNumberFormat = new Intl.NumberFormat('en-US');
+const formatFreezoneRankingNumber = (value?: number) => {
+  const safeValue = typeof value === 'number' && Number.isFinite(value)
+    ? Math.max(0, Math.floor(value))
+    : 0;
+  return freezoneRankingNumberFormat.format(safeValue);
 };
 type FreezoneShopTab = 'shop' | 'bots' | 'resources' | 'profile' | 'api';
 type FreezonePurchaseOrb = Exclude<FreezoneOrbEffect['type'], 'xp' | 'bot'>;
@@ -182,12 +228,15 @@ const FREEZONE_SPEECH_MODEL_DEFAULTS = {
   'gemini-live': 'models/gemini-3.8-live',
   'gemini-tts': 'gemini-3.8-flash-tts',
   'openai-tts': 'gpt-4o-mini-tts',
-  'google-tts': ''
+  'google-tts': '',
+  'qwen3-tts': 'qwen3-tts-flash',
+  kokoro: 'kokoro-82m'
 } as const;
 
 type FreezoneHud = {
   enabled: boolean;
   isPlayer: boolean;
+  playerSide: number;
   playerName: string;
   selectedPieceName: string;
   xp: number;
@@ -209,6 +258,7 @@ type FreezoneHud = {
   sharedMusicStartedAt: number;
   maxPatternOffsets: number;
   upgradeLevels: { red: number; blue: number; yellow: number; purple: number; white: number };
+  upgradeLevelLimits: { red: number; blue: number; yellow: number; purple: number; white: number };
   orbBalances: Record<FreezoneOrbEffect['type'], number>;
   allies: FreezoneAlly[];
   alliedBots: Array<FreezoneAlly & { side: number; playing: boolean }>;
@@ -233,15 +283,7 @@ type FreezoneHud = {
     eliminations: number;
   }>;
   onlinePlayers: FreezoneOnlinePlayer[];
-  teamPieces: Array<{
-    id: string;
-    name: string;
-    type: FreezoneOwnedPiece['type'];
-    ally: boolean;
-    cooldownDurationMs: number;
-    readyAt: number;
-    cooldownMs: number;
-  }>;
+  teamPieces: FreezoneTeamPiece[];
   economy: {
     pieceCostXP: number;
     allyCostXP: number;
@@ -249,12 +291,339 @@ type FreezoneHud = {
     eliminationXP: Record<string, number>;
   };
   roomLeaderboard?: FreezoneRoomRankingEntry[];
+  freezoneRelations: FreezoneRelation[];
+  freezoneAllianceInvitations: FreezoneAllianceInvitation[];
   botsEnabled: boolean;
 };
 
 type FreezoneApiResult = { ok: boolean; code?: string; error?: string };
+type FreezoneRelationAction = 'invite' | 'accept' | 'decline' | 'enemy' | 'neutral';
+type FreezoneUpgradePayment = 'orb' | 'xp';
+type FreezoneUpgradeModalStage =
+  | 'upgrades'
+  | 'acquire-choice'
+  | 'army-unlocked'
+  | 'controlled-piece'
+  | 'army-replacement'
+  | 'allied-bot'
+  | 'mobility'
+  | 'envelope'
+  | 'army-celebration'
+  | null;
 type FreezonePatternInput = Omit<FreezonePattern, 'id'> | FreezonePattern;
-type FreezonePanelProps = { mainMenuOpen: boolean };
+type FreezonePanelProps = {
+  mainMenuOpen: boolean;
+  displayPreferences: DisplayPreferences;
+  onOpenDisplaySettings: () => void;
+};
+
+function FreezonePieceCooldowns({
+  pieces,
+  hud,
+  canAcquireArmyUnit,
+  canBuyMobility,
+  purchaseBusy,
+  upgradeXpCosts,
+  feedback,
+  onUpgrade,
+  onAcquire,
+  onMobility
+}: {
+  pieces: FreezoneTeamPiece[];
+  hud: FreezoneHud;
+  canAcquireArmyUnit: boolean;
+  canBuyMobility: boolean;
+  purchaseBusy: boolean;
+  upgradeXpCosts: Record<'red' | 'blue' | 'yellow' | 'purple', number>;
+  feedback: string;
+  onUpgrade: (type: Exclude<FreezoneUpgrade, 'white'>) => void;
+  onAcquire: () => void;
+  onMobility: () => void;
+}) {
+  const [now, setNow] = useState(Date.now);
+
+  useEffect(() => {
+    if (!pieces.length) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [pieces.length]);
+
+  return (
+    <aside className="freezone-piece-cooldowns" aria-label="Your pieces and cooldown energy">
+      <strong>My pieces</strong>
+      {pieces.length ? pieces.map((piece) => {
+        const remaining = Math.max(0, piece.readyAt - now);
+        const duration = Math.max(1, piece.cooldownDurationMs);
+        const energy = Math.max(0, Math.min(100, 100 * (1 - remaining / duration)));
+        const icon = {
+          pawn: '♟',
+          knight: '♞',
+          bishop: '♝',
+          rook: '♜',
+          queen: '♛',
+          king: '♚'
+        }[piece.type] || '♟';
+        return (
+          <div className="freezone-piece-cooldown" key={piece.id}>
+            <span className="freezone-piece-cooldown-name" title={piece.name}>
+              <i aria-hidden="true">{icon}</i>{piece.name}
+              {piece.ally ? <small>Bot</small> : null}
+            </span>
+            <span
+              className="freezone-energy-track"
+              role="progressbar"
+              aria-label={`${piece.name} cooldown energy`}
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(energy)}
+            >
+              <i style={{ width: `${energy}%` }} />
+            </span>
+            <small>{remaining ? `${(remaining / 1000).toFixed(1)}s` : 'Ready'}</small>
+          </div>
+        );
+      }) : <span className="freezone-piece-cooldown-empty">No pieces</span>}
+      {hud.isPlayer && (
+        <FreezoneQuickUpgradeSpheres
+          hud={hud}
+          canAcquireArmyUnit={canAcquireArmyUnit}
+          canBuyMobility={canBuyMobility}
+          purchaseBusy={purchaseBusy}
+          upgradeXpCosts={upgradeXpCosts}
+          feedback={feedback}
+          onUpgrade={onUpgrade}
+          onAcquire={onAcquire}
+          onMobility={onMobility}
+        />
+      )}
+    </aside>
+  );
+}
+
+function FreezoneHudTimers({
+  cooldownMs,
+  movesPerCycle,
+  mutantZone
+}: {
+  cooldownMs: number;
+  movesPerCycle: number;
+  mutantZone: FreezoneHud['mutantZone'];
+}) {
+  const [now, setNow] = useState(Date.now);
+  const [cooldownEndsAt, setCooldownEndsAt] = useState(() => Date.now() + cooldownMs);
+  const [mutantEndsAt, setMutantEndsAt] = useState(
+    () => Date.now() + (mutantZone?.remainingMs || 0)
+  );
+  const cooldownRemaining = cooldownMs > 0 ? Math.max(0, cooldownEndsAt - now) : 0;
+  const mutantRemaining = mutantZone?.remainingMs
+    ? Math.max(0, mutantEndsAt - now)
+    : 0;
+
+  useEffect(() => {
+    setCooldownEndsAt(Date.now() + cooldownMs);
+  }, [cooldownMs]);
+
+  useEffect(() => {
+    setMutantEndsAt(Date.now() + (mutantZone?.remainingMs || 0));
+  }, [mutantZone?.remainingMs]);
+
+  useEffect(() => {
+    if (cooldownRemaining <= 0 && mutantRemaining <= 0) return undefined;
+    const timer = window.setInterval(() => setNow(Date.now()), 250);
+    return () => window.clearInterval(timer);
+  }, [cooldownRemaining > 0, mutantRemaining > 0]);
+
+  return (
+    <>
+      <span>
+        <strong>
+          {cooldownRemaining > 0
+            ? `${Math.ceil(cooldownRemaining / 1000)}s`
+            : `${movesPerCycle}/${movesPerCycle}`}
+        </strong>
+        {cooldownRemaining > 0 ? ' resting' : ' actions left'}
+      </span>
+      {mutantZone && (
+        <span className="freezone-mutant-summary">
+          <strong>{mutantZone.shape}</strong> mutates · {Math.ceil(mutantRemaining / 1000)}s left
+        </span>
+      )}
+    </>
+  );
+}
+
+function FreezoneUpgradeSphereRow({
+  label,
+  detail,
+  color,
+  level,
+  maxLevel,
+  canActivate,
+  onActivate,
+  xpCost,
+  canBuyWithXp,
+  onBuyWithXp
+}: {
+  label: string;
+  detail: string;
+  color: 'red' | 'blue' | 'yellow' | 'purple' | 'white' | 'teal' | 'orange';
+  level: number;
+  maxLevel: number;
+  canActivate: boolean;
+  onActivate: () => void;
+  xpCost?: number;
+  canBuyWithXp?: boolean;
+  onBuyWithXp?: () => void;
+}) {
+  return (
+    <section className={`freezone-sphere-row ${xpCost !== undefined ? 'has-xp' : ''}`} aria-label={`${label} upgrade`}>
+      <div className="freezone-sphere-row-copy">
+        <strong>{label}</strong>
+        <small>{detail}</small>
+      </div>
+      <div className="freezone-sphere-track" role="group" aria-label={`${label} levels`}>
+        {Array.from({ length: maxLevel }, (_, index) => {
+          const isOwned = index < level;
+          const isNext = index === level;
+          const isAvailable = isNext && canActivate;
+          return (
+            <button
+              key={index}
+              type="button"
+              className={`freezone-upgrade-sphere ${color} ${isOwned ? 'owned' : ''} ${isAvailable ? 'available' : ''}`}
+              aria-label={`${label} level ${index + 1}${isOwned ? ', active' : isAvailable ? ', available to buy' : ', locked'}`}
+              aria-pressed={isOwned}
+              disabled={!isAvailable}
+              onClick={onActivate}
+            >
+              <span aria-hidden="true" />
+            </button>
+          );
+        })}
+      </div>
+      <small className="freezone-sphere-level">{level}/{maxLevel}</small>
+      {xpCost !== undefined && (
+        <button
+          type="button"
+          className="freezone-sphere-xp-buy"
+          disabled={!canBuyWithXp || !onBuyWithXp}
+          onClick={onBuyWithXp}
+          aria-label={`Upgrade ${label} with ${xpCost} XP`}
+        >
+          XP {xpCost}
+        </button>
+      )}
+    </section>
+  );
+}
+
+function FreezoneQuickUpgradeSpheres({
+  hud,
+  canAcquireArmyUnit,
+  canBuyMobility,
+  purchaseBusy,
+  upgradeXpCosts,
+  feedback,
+  onUpgrade,
+  onAcquire,
+  onMobility
+}: {
+  hud: FreezoneHud;
+  canAcquireArmyUnit: boolean;
+  canBuyMobility: boolean;
+  purchaseBusy: boolean;
+  upgradeXpCosts: Record<'red' | 'blue' | 'yellow' | 'purple', number>;
+  feedback: string;
+  onUpgrade: (type: Exclude<FreezoneUpgrade, 'white'>) => void;
+  onAcquire: () => void;
+  onMobility: () => void;
+}) {
+  const skills = FREEZONE_UPGRADES.map((upgrade) => {
+    const level = hud.upgradeLevels[upgrade.type];
+    const maxLevel = hud.upgradeLevelLimits[upgrade.type];
+    const xpCost = upgradeXpCosts[upgrade.type];
+    const orbBalance = hud.orbBalances[upgrade.type];
+    return {
+      id: upgrade.type,
+      label: upgrade.label,
+      shortLabel: {
+        red: 'Actions',
+        blue: 'Steps',
+        yellow: 'Rest',
+        purple: 'Army'
+      }[upgrade.type],
+      color: upgrade.type,
+      level,
+      maxLevel,
+      canActivate: hud.isPlayer && hud.canUpgrade[upgrade.type] &&
+        (orbBalance >= 1 || hud.xp >= xpCost),
+      isBusy: purchaseBusy,
+      detail: `${level}/${maxLevel} · ${orbBalance ? `${orbBalance} orb` : `${xpCost} XP`}`,
+      onClick: () => onUpgrade(upgrade.type)
+    };
+  });
+  const spheres = [
+    ...skills,
+    {
+      id: 'unit',
+      label: 'Acquire an army unit',
+      shortLabel: 'Unit',
+      color: 'teal',
+      level: Math.min(hud.pieces, hud.capacity),
+      maxLevel: Math.max(1, hud.capacity),
+      canActivate: canAcquireArmyUnit,
+      isBusy: false,
+      detail: `Piece ${hud.xpCost} XP · bot ${hud.allyCost} XP`,
+      onClick: onAcquire
+    },
+    {
+      id: 'mobility',
+      label: 'Movement geometry',
+      shortLabel: 'Area',
+      color: 'white',
+      level: Math.min(hud.upgradeLevels.white, hud.upgradeLevelLimits.white),
+      maxLevel: Math.max(1, hud.upgradeLevelLimits.white),
+      canActivate: canBuyMobility,
+      isBusy: false,
+      detail: `${hud.envelopeRows}×${hud.envelopeCols}`,
+      onClick: onMobility
+    }
+  ] as const;
+
+  return (
+    <section className="freezone-quick-upgrades" aria-label="Freezone upgrade spheres">
+      <header>
+        <strong>Upgrade spheres</strong>
+        <small>{hud.xp} XP</small>
+      </header>
+      <div className="freezone-quick-upgrade-grid">
+        {spheres.map((sphere) => {
+          const canActivate = sphere.canActivate && !sphere.isBusy;
+          const isOwned = sphere.level >= sphere.maxLevel && !canActivate;
+          return (
+            <button
+              key={sphere.id}
+              type="button"
+              className={`freezone-quick-upgrade ${canActivate ? 'available' : ''} ${isOwned ? 'owned' : ''}`}
+              disabled={!canActivate}
+              title={`${sphere.label} · ${sphere.level}/${sphere.maxLevel} · ${sphere.detail}${canActivate ? ' · Click to unlock' : ' · Locked'}`}
+              aria-label={`${sphere.label}, ${sphere.level} of ${sphere.maxLevel}${canActivate ? ', available to unlock' : ', locked'}`}
+              onClick={sphere.onClick}
+            >
+              <span className={`freezone-quick-upgrade-orb ${sphere.color}`} aria-hidden="true">
+                <i />
+              </span>
+              <span className="freezone-quick-upgrade-label">{sphere.shortLabel}</span>
+              <span className="freezone-quick-upgrade-level">{sphere.level}/{sphere.maxLevel}</span>
+            </button>
+          );
+        })}
+      </div>
+      <small className="freezone-quick-upgrade-help">Click an available sphere to unlock</small>
+      {feedback && <span className="freezone-quick-upgrade-feedback" role="status">{feedback}</span>}
+    </section>
+  );
+}
 
 function readLocalSetting(key: string, fallback = '') {
   try {
@@ -296,6 +665,40 @@ const FREEZONE_ALLY_DESCRIPTIONS: Record<FreezoneAllyRole, string> = {
   guardian: 'Stays close to your king and moves to meet nearby threats.',
   collector: 'Prioritizes bot orbs, then seeks other nearby orbs.'
 };
+const FREEZONE_PERSONALITIES = [
+  {
+    id: 'natural-leader',
+    name: 'Natural leader',
+    description: 'Inspires allies, keeps the team focused, and encourages them under pressure.',
+    prompt: 'A natural leader who inspires allies, keeps the team focused, and encourages them under pressure.',
+    phrase: 'Friends, never give up!',
+    portraitMark: '✦'
+  },
+  {
+    id: 'wise-strategist',
+    name: 'Wise strategist',
+    description: 'Thinks several moves ahead and speaks calmly, even when the board is dangerous.',
+    prompt: 'A wise strategist who thinks several moves ahead and speaks calmly under pressure.',
+    phrase: 'Every move has a purpose.',
+    portraitMark: '⌘'
+  },
+  {
+    id: 'steadfast-guardian',
+    name: 'Steadfast guardian',
+    description: 'Protects teammates first and refuses to abandon a threatened ally.',
+    prompt: 'A steadfast guardian who protects teammates first and refuses to abandon a threatened ally.',
+    phrase: 'Stay close. I will protect you.',
+    portraitMark: '◇'
+  },
+  {
+    id: 'bold-champion',
+    name: 'Bold champion',
+    description: 'Faces danger with confidence and motivates the team to keep advancing.',
+    prompt: 'A bold champion who faces danger with confidence and motivates the team to keep advancing.',
+    phrase: 'Forward. We can still win!',
+    portraitMark: '⚔'
+  }
+] as const;
 
 function movementText(
   moves: MoveOffset[],
@@ -313,15 +716,22 @@ function movementText(
   return `${slide ? 'Sliding' : 'Step'}: ${directions}`;
 }
 
-export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
+export default function FreezonePanel({
+  mainMenuOpen,
+  displayPreferences,
+  onOpenDisplaySettings
+}: FreezonePanelProps) {
   const [hud, setHud] = useState<FreezoneHud | null>(null);
   const [open, setOpen] = useState(false);
   const activeFreezoneHudRef = useRef(false);
+  const seenAllianceInvitationsRef = useRef(new Set<string>());
   const [busy, setBusy] = useState(false);
   const [purchaseBusy, setPurchaseBusy] = useState(false);
+  const [relationBusy, setRelationBusy] = useState(false);
   const [roomCode, setRoomCode] = useState('');
   const [joinCode, setJoinCode] = useState('');
   const [status, setStatus] = useState('');
+  const [quickUpgradeFeedback, setQuickUpgradeFeedback] = useState('');
   const [rooms, setRooms] = useState<FreezoneRoom[]>([]);
   const [roomsLoading, setRoomsLoading] = useState(false);
   const [notice, setNotice] = useState('');
@@ -329,9 +739,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [radioOpen, setRadioOpen] = useState(false);
   const [rankingCollapsed, setRankingCollapsed] = useState(false);
   const [activeShopTab, setActiveShopTab] = useState<FreezoneShopTab>('shop');
+  const [upgradeModalStage, setUpgradeModalStage] = useState<FreezoneUpgradeModalStage>(null);
   const [allyNameDraft, setAllyNameDraft] = useState('');
   const [editingPieceId, setEditingPieceId] = useState('');
-  const [cooldownNow, setCooldownNow] = useState(Date.now);
   const [compactLeaderboard, setCompactLeaderboard] = useState(
     () => (typeof window === 'undefined' ? false : shouldUseCompactFreezoneLeaderboard(window.innerWidth))
   );
@@ -341,10 +751,13 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [pieceType, setPieceType] = useState<PieceType>('knight');
   const [pieceName, setPieceName] = useState('');
   const [pieceTitle, setPieceTitle] = useState('');
+  const [armyCelebrationName, setArmyCelebrationName] = useState('');
   const [pieceDescription, setPieceDescription] = useState('');
   const [piecePersonality, setPiecePersonality] = useState('');
   const [pieceLanguage, setPieceLanguage] = useState('en-US');
   const [pieceAIVoice, setPieceAIVoice] = useState('alloy');
+  const [pieceQwenVoice, setPieceQwenVoice] = useState('');
+  const [pieceKokoroVoice, setPieceKokoroVoice] = useState('');
   const [pieceCatchphrase, setPieceCatchphrase] = useState('');
   const [appearance, setAppearance] = useState(FREEZONE_APPEARANCES[0].id);
   const [voiceLines, setVoiceLines] = useState<PieceVoiceLines>({
@@ -360,11 +773,24 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [aiVoiceEnabled, setAIVoiceEnabled] = useState(
     () => readLocalSetting('freezone-ai-voice-enabled') === 'true'
   );
+  const [aiVoiceMode, setAIVoiceMode] = useState<'tts' | 'fallback'>(
+    () => readLocalSetting('freezone-ai-voice-mode') === 'fallback' ? 'fallback' : 'tts'
+  );
+  const [fallbackVoiceEngine, setFallbackVoiceEngine] = useState<'browser' | 'kokoro'>(() =>
+    readLocalSetting('freezone-fallback-voice-engine') === 'kokoro' ? 'kokoro' : 'browser'
+  );
+  const [fallbackKokoroVoice, setFallbackKokoroVoice] = useState(() => {
+    const saved = readLocalSetting('freezone-fallback-kokoro-voice');
+    return FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(saved) ? saved : 'af_heart';
+  });
   const [aiAssistEnabled, setAIAssistEnabled] = useState(
     () => readLocalSetting('freezone-ai-assist-enabled') === 'true'
   );
   const [aiBotsEnabled, setAIBotsEnabled] = useState(
     () => readLocalSetting('freezone-ai-bots-enabled') === 'true'
+  );
+  const [aiMovementMode, setAIMovementMode] = useState<'provider' | 'local'>(() =>
+    readLocalSetting('freezone-ai-movement-mode') === 'local' ? 'local' : 'provider'
   );
   const [aiSettings, setAISettings] = useState(() => {
     try {
@@ -374,6 +800,10 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       updateFreezoneAISettings({});
     }
     return getFreezoneAISettings();
+  });
+  const [fallbackDialogueLanguage, setFallbackDialogueLanguage] = useState(() => {
+    const saved = readLocalSetting('freezone-fallback-dialogue-language');
+    return FREEZONE_AI_LANGUAGES.some(({ id }) => id === saved) ? saved : 'en-US';
   });
   const [aiServiceStatuses, setAIServiceStatuses] = useState<
     Partial<Record<FreezoneAIService, FreezoneAIServiceStatus>>
@@ -398,6 +828,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const [targetMovementA, setTargetMovementA] = useState(1);
   const [selectedMovementPieceId, setSelectedMovementPieceId] = useState('');
   const [movementKind, setMovementKind] = useState<'drag' | 'jump' | 'teleport'>('drag');
+  const [movementPayment, setMovementPayment] = useState<FreezoneUpgradePayment>('orb');
+  const [selectedAcquisitionPatternId, setSelectedAcquisitionPatternId] = useState('');
+  const [selectedPersonalityId, setSelectedPersonalityId] = useState('');
   const [slide, setSlide] = useState(false);
   const noticeTimer = useRef<number | null>(null);
   const feedbackTimer = useRef<number | null>(null);
@@ -405,9 +838,20 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const localMusicUrl = useRef('');
   const aiVoiceAudioRef = useRef<HTMLAudioElement | null>(null);
   const aiVoiceUrlRef = useRef('');
-  const aiVoiceQueueRef = useRef(Promise.resolve());
+  const aiVoiceRequestIdRef = useRef(0);
+  const aiVoiceAbortRef = useRef<AbortController | null>(null);
   const aiVoiceEnabledRef = useRef(aiVoiceEnabled);
+  const aiVoiceModeRef = useRef(aiVoiceMode);
+  const fallbackVoiceEngineRef = useRef(fallbackVoiceEngine);
   const voiceCooldowns = useRef(new Map<string, number>());
+
+  const cancelPendingAIVoice = () => {
+    aiVoiceRequestIdRef.current += 1;
+    aiVoiceAbortRef.current?.abort();
+    aiVoiceAbortRef.current = null;
+    aiVoiceAudioRef.current?.pause();
+    if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+  };
 
   useEffect(() => {
     try {
@@ -433,10 +877,28 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         dialogueModel: aiSettings.dialogueModel,
         dialogueEnabled: aiSettings.dialogueEnabled,
         voiceProvider: aiSettings.voiceProvider,
-        voiceModel: aiSettings.voiceModel
+        voiceModel: aiSettings.voiceModel,
+        qwenVoice: aiSettings.qwenVoice,
+        qwenLanguage: aiSettings.qwenLanguage,
+        kokoroVoice: aiSettings.kokoroVoice
       }));
     } catch {}
   }, [aiSettings]);
+
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(
+        'freezone-fallback-dialogue-language',
+        fallbackDialogueLanguage
+      );
+    } catch {}
+    window.dispatchEvent(new CustomEvent('wizard-chess-freezone-local-dialogue-settings', {
+      detail: {
+        enabled: aiSettings.dialogueEnabled,
+        language: fallbackDialogueLanguage
+      }
+    }));
+  }, [aiSettings.dialogueEnabled, fallbackDialogueLanguage]);
 
   const updateAISettings = (change: Partial<ReturnType<typeof getFreezoneAISettings>>) => {
     const next = {
@@ -453,6 +915,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     if ('dialogueProvider' in change || 'dialogueModel' in change ||
         change.serviceApiKeys?.dialogue !== undefined) changed.push('dialogue');
     if ('voiceProvider' in change || 'voiceModel' in change ||
+        'qwenVoice' in change || 'qwenLanguage' in change || 'kokoroVoice' in change ||
         change.serviceApiKeys?.speech !== undefined) changed.push('speech');
     if (changed.length) {
       setAIServiceStatuses((current) => ({
@@ -467,7 +930,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
 
   const clearAIKeys = () => {
     clearFreezoneAIKeys();
-    const apiKeys = { openrouter: '', gemini: '', openai: '', deepseek: '', google: '' };
+    const apiKeys = {
+      openrouter: '', gemini: '', openai: '', deepseek: '', google: '', dashscope: '', kokoro: ''
+    };
     const serviceApiKeys = { movement: '', dialogue: '', speech: '' };
     const next = { ...aiSettings, apiKeys, serviceApiKeys };
     setAISettings(next);
@@ -521,7 +986,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         : aiSettings.voiceModel;
     const keyProvider: keyof typeof aiSettings.apiKeys = service === 'speech'
       ? provider === 'google-tts' ? 'google'
-        : provider === 'openai-tts' ? 'openai' : 'gemini'
+        : provider === 'openai-tts' ? 'openai'
+          : provider === 'qwen3-tts' ? 'dashscope'
+            : provider === 'kokoro' ? 'kokoro' : 'gemini'
       : provider as FreezoneTextProvider;
     const apiKey = aiSettings.serviceApiKeys[service] || aiSettings.apiKeys[keyProvider] || '';
     setAIServiceStatuses((current) => ({
@@ -535,7 +1002,16 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }));
 
     try {
-      const request = { roomCode: currentRoomCode, playerToken, provider, model, apiKey };
+      const request = {
+        roomCode: currentRoomCode,
+        playerToken,
+        provider,
+        model,
+        apiKey,
+        qwenVoice: aiSettings.qwenVoice,
+        qwenLanguage: aiSettings.qwenLanguage,
+        kokoroVoice: aiSettings.kokoroVoice
+      };
       let successMessage = '';
       if (service === 'speech') {
         const audio = await testFreezoneSpeechService(request);
@@ -635,7 +1111,31 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   }, []);
 
   useEffect(() => {
-    const speak = (pieceId: string, eventKey: VoiceEventKey, lines: PieceVoiceLines) => {
+    if (aiVoiceMode !== 'fallback' || fallbackVoiceEngine !== 'kokoro') return undefined;
+    let active = true;
+    void preloadFreezoneKokoroSpeech((message) => {
+      if (active) setAIVoiceStatus(message);
+    }).then(() => {
+      if (active) setAIVoiceStatus('Kokoro model is ready on this device.');
+    }).catch((error: unknown) => {
+      if (active) {
+        setAIVoiceStatus(error instanceof Error
+          ? error.message
+          : 'Kokoro model could not be prepared.');
+      }
+    });
+    return () => {
+      active = false;
+    };
+  }, [aiVoiceMode, fallbackVoiceEngine]);
+
+  useEffect(() => {
+    const speak = (
+      pieceId: string,
+      eventKey: VoiceEventKey,
+      lines: PieceVoiceLines,
+      language?: string
+    ) => {
       if (!('speechSynthesis' in window)) return;
       const line = lines?.[eventKey];
       const voice = resolveFreezoneVoice(voices, selectedVoiceURI);
@@ -643,10 +1143,13 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       if (!shouldSpeakFreezoneVoice(voiceEnabled, line, available)) return;
       const cooldownKey = `${pieceId}:${eventKey}`;
       const now = Date.now();
-      const cooldown = eventKey === 'inspection' ? 12000 : 30000;
+      const cooldown = eventKey === 'vulnerable' ? 15000
+        : eventKey === 'inspection' ? 12000
+          : 500;
       if (now - (voiceCooldowns.current.get(cooldownKey) || 0) < cooldown) return;
       voiceCooldowns.current.set(cooldownKey, now);
       const utterance = new SpeechSynthesisUtterance(line.trim().slice(0, 120));
+      utterance.lang = language || voice?.lang || navigator.language;
       utterance.voice = voice || voices[0] || null;
       window.speechSynthesis.speak(utterance);
     };
@@ -663,21 +1166,99 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       event?: VoiceEventKey;
       text: string;
       voiceId?: string;
+      language?: string;
+      kokoroVoice?: string;
     }) => {
-      if (!detail.roomCode ||
+      const localFallback = aiVoiceMode === 'fallback';
+      const localKokoro = localFallback && fallbackVoiceEngine === 'kokoro';
+      if (localFallback) {
+        if (!aiVoiceEnabled || !detail.text.trim()) return;
+      } else if (!detail.roomCode ||
           !shouldRequestFreezoneAIVoice(
             aiVoiceEnabled, detail.text, detail.voiceId, aiSettings.voiceProvider
           )) return;
       const cooldownKey = `ai:${detail.dialogueId || detail.event || 'line'}:${detail.pieceId}`;
       const now = Date.now();
-      if (now - (voiceCooldowns.current.get(cooldownKey) || 0) < 30000) return;
+      if (now - (voiceCooldowns.current.get(cooldownKey) || 0) < 700) return;
       voiceCooldowns.current.set(cooldownKey, now);
       if (voiceCooldowns.current.size > 512) {
         const oldestKey = voiceCooldowns.current.keys().next().value;
         if (oldestKey) voiceCooldowns.current.delete(oldestKey);
       }
-      aiVoiceQueueRef.current = aiVoiceQueueRef.current.then(async () => {
+      const requestId = ++aiVoiceRequestIdRef.current;
+      aiVoiceAbortRef.current?.abort();
+      const controller = localFallback ? null : new AbortController();
+      aiVoiceAbortRef.current = controller;
+      aiVoiceAudioRef.current?.pause();
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      const reportRequestStatus = (message: string) => {
+        if (aiVoiceRequestIdRef.current === requestId) setAIVoiceStatus(message);
+      };
+      const playGeneratedAudio = async (blob: Blob, readyMessage: string) => {
+        if (aiVoiceRequestIdRef.current !== requestId) return;
+        if (aiVoiceUrlRef.current) URL.revokeObjectURL(aiVoiceUrlRef.current);
+        const url = URL.createObjectURL(blob);
+        aiVoiceUrlRef.current = url;
+        setAIVoiceReady(true);
+        const audio = aiVoiceAudioRef.current;
+        if (!audio) return;
+        audio.src = url;
+        audio.load();
+        try {
+          await audio.play();
+          if (aiVoiceRequestIdRef.current === requestId) setAIVoiceStatus(readyMessage);
+        } catch {
+          if (aiVoiceRequestIdRef.current === requestId) {
+            reportAIVoiceStatus('Audio is ready. Press “Play latest voice preview” to listen.');
+          }
+        }
+      };
+      void (async () => {
         if (!aiVoiceEnabledRef.current) return;
+        if (localFallback) {
+          if (aiVoiceModeRef.current !== 'fallback') return;
+          if (localKokoro) {
+            if (fallbackVoiceEngineRef.current !== 'kokoro') return;
+            const pieceVoiceId = detail.kokoroVoice || '';
+            const voiceId = FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(pieceVoiceId)
+              ? pieceVoiceId
+              : fallbackKokoroVoice;
+            const blob = await generateFreezoneKokoroSpeech(
+              detail.text.trim().slice(0, 120),
+              voiceId,
+              reportRequestStatus
+            );
+            if (!aiVoiceEnabledRef.current || aiVoiceModeRef.current !== 'fallback' ||
+                fallbackVoiceEngineRef.current !== 'kokoro' ||
+                aiVoiceRequestIdRef.current !== requestId) return;
+            await playGeneratedAudio(blob, 'Kokoro speech generated locally on this device.');
+            return;
+          }
+          if (!('speechSynthesis' in window)) {
+            reportAIVoiceStatus('Browser speech is unavailable for the selected fallback.');
+            return;
+          }
+          if (!voices.length) {
+            reportAIVoiceStatus('No browser voices are available on this device yet.');
+            return;
+          }
+          const voice = resolveFreezoneVoice(voices, selectedVoiceURI);
+          if (selectedVoiceURI && !voice) {
+            reportAIVoiceStatus('The selected browser fallback voice is unavailable on this device.');
+            return;
+          }
+          const utterance = new SpeechSynthesisUtterance(detail.text.trim().slice(0, 120));
+          utterance.lang = detail.language || 'en-US';
+          utterance.voice = voice || null;
+          utterance.onend = () => {
+            if (aiVoiceRequestIdRef.current === requestId) {
+              setAIVoiceStatus('Browser fallback speech finished.');
+            }
+          };
+          window.speechSynthesis.speak(utterance);
+          return;
+        }
+        if (aiVoiceModeRef.current !== 'tts') return;
         const playerToken = readLocalSetting('wizard_chess_token');
         if (!playerToken) {
           reportAIVoiceStatus('Join the Freezone room before requesting character voice.');
@@ -690,35 +1271,27 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
             dialogueId: detail.dialogueId,
             pieceId: detail.pieceId,
             event: detail.event,
-            text: detail.text
-          });
-          if (!aiVoiceEnabledRef.current) return;
-          if (aiVoiceUrlRef.current) URL.revokeObjectURL(aiVoiceUrlRef.current);
-          const url = URL.createObjectURL(blob);
-          aiVoiceUrlRef.current = url;
-          setAIVoiceReady(true);
-          setAIVoiceStatus('Character voice is ready.');
-          const audio = aiVoiceAudioRef.current;
-          if (audio) {
-            audio.src = url;
-            audio.load();
-            try {
-              await audio.play();
-            } catch {
-              reportAIVoiceStatus('Autoplay was blocked. Use “Play latest voice” to listen.');
-            }
-          }
+            language: detail.language,
+            text: detail.text,
+            kokoroVoice: detail.kokoroVoice
+          }, controller?.signal);
+          if (!aiVoiceEnabledRef.current || aiVoiceModeRef.current !== 'tts' ||
+              aiVoiceRequestIdRef.current !== requestId) return;
+          await playGeneratedAudio(blob, 'Character voice is ready.');
         } catch (error) {
+          if (aiVoiceRequestIdRef.current !== requestId ||
+              (error instanceof Error && error.name === 'AbortError')) return;
           const message = error instanceof TypeError && /failed to fetch/i.test(error.message)
             ? 'Generated voice is unavailable: the freezone-speech function has a deployment or CORS problem. AI movement and text are unaffected.'
             : error instanceof Error ? error.message : 'Character voice could not be generated.';
           reportAIVoiceStatus(message);
         }
-      }).catch((error: unknown) => {
-        const message = error instanceof TypeError && /failed to fetch/i.test(error.message)
-          ? 'Generated voice is unavailable: the freezone-speech function has a deployment or CORS problem. AI movement and text are unaffected.'
-          : error instanceof Error ? error.message : 'Character voice could not be generated.';
-        reportAIVoiceStatus(message);
+      })().catch((error: unknown) => {
+        if (aiVoiceRequestIdRef.current !== requestId ||
+            (error instanceof Error && error.name === 'AbortError')) return;
+        reportAIVoiceStatus(error instanceof Error
+          ? error.message
+          : 'Character voice could not be generated.');
       });
     };
     const handleVoice = (event: Event) => {
@@ -728,17 +1301,23 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         event: VoiceEventKey;
         text?: string;
         voiceId?: string;
+        language?: string;
+        kokoroVoice?: string;
         voiceLines: PieceVoiceLines;
       }>).detail;
       if (!detail) return;
-      if (!aiVoiceEnabled) speak(detail.pieceId, detail.event, detail.voiceLines);
+      if (!aiVoiceEnabled) {
+        speak(detail.pieceId, detail.event, detail.voiceLines, detail.language);
+      }
       if (detail.text) {
         queueGeneratedVoice({
           roomCode: detail.roomCode,
           pieceId: detail.pieceId,
           event: detail.event,
           text: detail.text,
-          voiceId: detail.voiceId
+          voiceId: detail.voiceId,
+          language: detail.language,
+          kokoroVoice: detail.kokoroVoice
         });
       }
     };
@@ -757,6 +1336,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         pieceId: string;
         text: string;
         voiceId: string;
+        language?: string;
+        kokoroVoice?: string;
       } | null>).detail;
       if (detail) queueGeneratedVoice(detail);
     };
@@ -770,24 +1351,39 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       window.removeEventListener('wizard-chess-freezone-speech', handleSpeech);
       window.removeEventListener('wizard-chess-freezone-ai-voice', handleAIVoice);
     };
-  }, [aiSettings.voiceProvider, aiVoiceEnabled, selectedVoiceURI, voiceEnabled, voices]);
+  }, [
+    aiSettings.kokoroVoice, aiSettings.voiceProvider, aiVoiceEnabled, aiVoiceMode,
+    fallbackKokoroVoice, fallbackVoiceEngine, selectedVoiceURI, voiceEnabled, voices
+  ]);
 
   useEffect(() => {
+    cancelPendingAIVoice();
     aiVoiceEnabledRef.current = aiVoiceEnabled;
-    if (!aiVoiceEnabled) aiVoiceAudioRef.current?.pause();
-  }, [aiVoiceEnabled]);
+    aiVoiceModeRef.current = aiVoiceMode;
+    fallbackVoiceEngineRef.current = fallbackVoiceEngine;
+  }, [aiVoiceEnabled, aiVoiceMode, fallbackVoiceEngine]);
 
   useEffect(() => {
     try {
       window.localStorage.setItem('freezone-voice-enabled', String(voiceEnabled));
       window.localStorage.setItem('freezone-ai-voice-enabled', String(aiVoiceEnabled));
+      window.localStorage.setItem('freezone-ai-voice-mode', aiVoiceMode);
+      window.localStorage.setItem('freezone-ai-movement-mode', aiMovementMode);
+      window.localStorage.setItem('freezone-fallback-voice-engine', fallbackVoiceEngine);
+      window.localStorage.setItem('freezone-fallback-kokoro-voice', fallbackKokoroVoice);
       window.localStorage.setItem('freezone-voice-uri', selectedVoiceURI);
       window.localStorage.setItem('freezone-music-url', /^https?:\/\//i.test(musicSource) ? musicSource : '');
       window.localStorage.setItem('freezone-music-volume', String(musicVolume));
     } catch {
       setStatus('Browser storage is unavailable; audio preferences will last only for this visit.');
     }
-  }, [aiVoiceEnabled, musicSource, musicVolume, selectedVoiceURI, voiceEnabled]);
+    window.dispatchEvent(new CustomEvent('wizard-chess-freezone-ai-movement-mode', {
+      detail: aiMovementMode
+    }));
+  }, [
+    aiVoiceEnabled, aiVoiceMode, fallbackVoiceEngine, musicSource, musicVolume,
+    aiMovementMode, fallbackKokoroVoice, selectedVoiceURI, voiceEnabled
+  ]);
 
   useEffect(() => {
     const audio = musicRef.current;
@@ -853,6 +1449,24 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       activeFreezoneHudRef.current = enabled;
       setHud(enabled ? detail : null);
       if (enabled !== wasEnabled) setOpen(false);
+      const incomingInvitations = enabled && detail.isPlayer
+        ? detail.freezoneAllianceInvitations.filter((invite) =>
+          invite.status === 'pending' && invite.toSide === detail.playerSide)
+        : [];
+      const newInvitation = incomingInvitations.find((invite) =>
+        !seenAllianceInvitationsRef.current.has(invite.id)
+      );
+      incomingInvitations.forEach((invite) =>
+        seenAllianceInvitationsRef.current.add(invite.id)
+      );
+      if (newInvitation) {
+        const senderName = detail.onlinePlayers.find((player) =>
+          player.side === newInvitation.fromSide
+        )?.name || `Team ${newInvitation.fromSide + 1}`;
+        setNotice(`${senderName} invited your team to an alliance. Respond in the room ranking panel.`);
+        if (noticeTimer.current !== null) window.clearTimeout(noticeTimer.current);
+        noticeTimer.current = window.setTimeout(() => setNotice(''), 5000);
+      }
       if (typeof detail?.aiBotsEnabled === 'boolean') {
         setAIBotsEnabled(detail.aiBotsEnabled);
       }
@@ -955,24 +1569,29 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   }, [open, hud]);
 
   useEffect(() => {
-    if (!hud?.enabled) return;
-    const timer = window.setInterval(() => {
-      setHud((current) => current
-        ? {
-          ...current,
-          cooldownMs: Math.max(0, current.cooldownMs - 250),
-          movesUsed: current.cooldownMs <= 250 ? 0 : current.movesUsed,
-          mutantZone: current.mutantZone
-            ? {
-              ...current.mutantZone,
-              remainingMs: Math.max(0, current.mutantZone.remainingMs - 250)
-            }
-            : null
-        }
-        : current);
-    }, 250);
-    return () => window.clearInterval(timer);
-  }, [hud?.enabled]);
+    if (!hud?.pieceOptions.length) {
+      setSelectedAcquisitionPatternId('');
+      return;
+    }
+    setSelectedAcquisitionPatternId((current) =>
+      hud.pieceOptions.some((pattern) => pattern.id === current)
+        ? current
+        : hud.pieceOptions[0].id
+    );
+  }, [hud?.pieceOptions]);
+
+  useEffect(() => {
+    if (!open) setUpgradeModalStage(null);
+  }, [open]);
+
+  useEffect(() => {
+    if (!upgradeModalStage) return undefined;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setUpgradeModalStage(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [upgradeModalStage]);
 
   useEffect(() => {
     if (!hud) return;
@@ -1069,6 +1688,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     if (hud && hud.pieces >= hud.capacity && !replacementId) {
       setPendingReplacement(pattern);
       setStatus(`Army full. Choose a piece to replace; this costs ${hud.xpCost} XP.`);
+      if (upgradeModalStage === 'controlled-piece') {
+        setUpgradeModalStage('army-replacement');
+      }
       return;
     }
     setPurchaseBusy(true);
@@ -1076,9 +1698,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       const result = await action(pattern, replacementId);
       if (result.ok) {
         setPendingReplacement(null);
-        setStatus(replacementId
-          ? `${pattern.name} acquired; the selected piece was replaced.`
-          : `${pattern.name} acquired. It has joined your army.`);
+        setArmyCelebrationName(pattern.name);
+        setStatus('');
+        setUpgradeModalStage('army-celebration');
         emitTeamVoiceEvent('purchase');
       } else {
         setStatus(result.error || 'Could not acquire this piece.');
@@ -1101,6 +1723,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         event: eventKey,
         text,
         voiceId: speaker.aiVoice,
+        language: speaker.language,
+        kokoroVoice: speaker.kokoroVoice,
         voiceLines: speaker.voiceLines
       }
     }));
@@ -1115,6 +1739,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     personality: piecePersonality.trim() || pattern.personality,
     language: pieceLanguage || pattern.language,
     aiVoice: pieceAIVoice || pattern.aiVoice,
+    qwenVoice: pieceQwenVoice,
+    kokoroVoice: pieceKokoroVoice,
     catchphrase: pieceCatchphrase.trim() || pattern.catchphrase,
     voiceLines
   });
@@ -1261,6 +1887,33 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }
   };
 
+  const changeTeamRelation = async (
+    targetSide: number,
+    action: FreezoneRelationAction,
+    invitationId = ''
+  ) => {
+    const change = window.wizardChess?.setFreezoneTeamRelation;
+    if (!change) {
+      setStatus('Freezone is still starting. Try again in a moment.');
+      return;
+    }
+    setRelationBusy(true);
+    try {
+      const result = await change(targetSide, action, invitationId);
+      setStatus(result.ok
+        ? action === 'invite' ? 'Alliance invitation sent.'
+          : action === 'accept' ? 'Alliance accepted for both teams.'
+            : action === 'decline' ? 'Alliance invitation declined.'
+              : action === 'enemy' ? 'Mortal enemy declared.'
+                : 'Team relation set to neutral.'
+        : result.error || 'Could not change this team relation.');
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : 'Could not change this team relation.');
+    } finally {
+      setRelationBusy(false);
+    }
+  };
+
   const recruitAlly = async () => {
     const action = window.wizardChess?.buyFreezoneAlly;
     if (!action) {
@@ -1276,6 +1929,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       if (result.ok) {
         setAllyNameDraft('');
         setActiveShopTab('bots');
+        setUpgradeModalStage(null);
       }
     } catch (error) {
       setStatus(error instanceof Error ? error.message : 'Could not recruit an allied bot.');
@@ -1314,6 +1968,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     setPiecePersonality(profile.personality);
     setPieceLanguage(profile.language);
     setPieceAIVoice(profile.aiVoice);
+    setPieceQwenVoice(profile.qwenVoice || '');
+    setPieceKokoroVoice(profile.kokoroVoice || '');
     setPieceCatchphrase(profile.catchphrase);
     setAppearance(profile.appearance || FREEZONE_APPEARANCES[0].id);
     setVoiceLines(profile.voiceLines);
@@ -1325,6 +1981,12 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       setStatus('Choose one of your units to edit first.');
       return;
     }
+    cancelPendingAIVoice();
+    for (const cooldownKey of voiceCooldowns.current.keys()) {
+      if (cooldownKey.startsWith('ai:') && cooldownKey.endsWith(`:${editingPieceId}`)) {
+        voiceCooldowns.current.delete(cooldownKey);
+      }
+    }
     setPurchaseBusy(true);
     try {
       const result = await action(editingPieceId, {
@@ -1334,6 +1996,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         personality: piecePersonality,
         language: pieceLanguage,
         aiVoice: pieceAIVoice,
+        qwenVoice: pieceQwenVoice,
+        kokoroVoice: pieceKokoroVoice,
         catchphrase: pieceCatchphrase,
         appearance,
         voiceLines
@@ -1348,14 +2012,75 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }
   };
 
-  const previewPieceVoice = () => {
-    if (!('speechSynthesis' in window)) {
-      setStatus('Speech preview is not supported in this browser.');
-      return;
+  const playSpeechBlob = async (blob: Blob, successMessage: string) => {
+    aiVoiceAudioRef.current?.pause();
+    if (aiVoiceUrlRef.current) URL.revokeObjectURL(aiVoiceUrlRef.current);
+    const url = URL.createObjectURL(blob);
+    aiVoiceUrlRef.current = url;
+    const audio = new Audio(url);
+    aiVoiceAudioRef.current = audio;
+    setAIVoiceReady(true);
+    try {
+      await audio.play();
+      setStatus(successMessage);
+    } catch {
+      setStatus('Audio is ready, but playback was blocked by the browser.');
     }
-    const text = pieceCatchphrase.trim() || voiceLines.move.trim() || voiceLines.entry.trim();
+  };
+
+  const previewPieceVoice = async (lineText?: string) => {
+    const text = lineText?.trim() ||
+      pieceCatchphrase.trim() || voiceLines.move.trim() || voiceLines.entry.trim();
     if (!text) {
       setStatus('Add a public phrase or voice line before previewing.');
+      return;
+    }
+    if (aiVoiceMode === 'fallback' && fallbackVoiceEngine === 'kokoro') {
+      const voiceId = FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(pieceKokoroVoice)
+        ? pieceKokoroVoice
+        : fallbackKokoroVoice;
+      try {
+        const blob = await generateFreezoneKokoroSpeech(
+          text.slice(0, 120),
+          voiceId,
+          setStatus
+        );
+        await playSpeechBlob(blob, 'Kokoro preview played locally on this device.');
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Kokoro preview failed.');
+      }
+      return;
+    }
+    if (aiVoiceMode === 'tts') {
+      const currentRoomCode = hud?.roomCode || roomCode;
+      const playerToken = readLocalSetting('wizard_chess_token');
+      if (!currentRoomCode || !playerToken) {
+        setStatus('Join a Freezone room to test the selected TTS provider.');
+        return;
+      }
+      const settings = getFreezoneAIRequestSettings();
+      try {
+        const blob = await testFreezoneSpeechService({
+          roomCode: currentRoomCode,
+          playerToken,
+          provider: settings.voiceProvider,
+          model: settings.voiceModel,
+          apiKey: settings.voiceApiKey,
+          voiceId: pieceAIVoice,
+          language: pieceLanguage,
+          qwenVoice: pieceQwenVoice || settings.qwenVoice,
+          qwenLanguage: settings.qwenLanguage,
+          kokoroVoice: pieceKokoroVoice || settings.kokoroVoice,
+          text: text.slice(0, 120)
+        });
+        await playSpeechBlob(blob, 'Selected character voice preview played.');
+      } catch (error) {
+        setStatus(error instanceof Error ? error.message : 'Selected voice preview failed.');
+      }
+      return;
+    }
+    if (!('speechSynthesis' in window)) {
+      setStatus('Speech preview is not supported in this browser.');
       return;
     }
     window.speechSynthesis.cancel();
@@ -1366,21 +2091,118 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     setStatus('Playing a local voice preview on this device only.');
   };
 
-  const purchaseUpgrade = async (type: FreezoneUpgrade) => {
+  const previewPieceVoiceLine = (lineText: string) => {
+    const text = lineText.trim();
+    if (!text) {
+      setStatus('Enter a phrase before previewing it.');
+      return;
+    }
+    if (!('speechSynthesis' in window)) {
+      setStatus('Local phrase preview is not supported in this browser.');
+      return;
+    }
+    const voice = resolveFreezoneVoice(voices, selectedVoiceURI);
+    if (selectedVoiceURI && !voice) {
+      setStatus('The selected browser voice is unavailable on this device.');
+      return;
+    }
+    aiVoiceAudioRef.current?.pause();
+    if (window.speechSynthesis.speaking || window.speechSynthesis.pending) {
+      window.speechSynthesis.cancel();
+    }
+    const utterance = new SpeechSynthesisUtterance(text.slice(0, 120));
+    utterance.lang = pieceLanguage || voice?.lang || navigator.language;
+    utterance.voice = voice || null;
+    utterance.onstart = () => setStatus('Playing this phrase with the local browser voice.');
+    utterance.onerror = (event) => {
+      setStatus(`Phrase preview failed: ${event.error || 'browser speech error'}.`);
+    };
+    setStatus('Starting local phrase preview…');
+    if (window.speechSynthesis.paused) window.speechSynthesis.resume();
+    window.speechSynthesis.speak(utterance);
+  };
+
+  const previewAIVoiceFallback = async () => {
+    if (fallbackVoiceEngine === 'kokoro') {
+      const voiceId = fallbackKokoroVoice;
+      if (!FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(voiceId)) {
+        setAIVoiceStatus('Kokoro in the browser currently supports English voices only.');
+        return;
+      }
+      try {
+        const previewText = pieceCatchphrase.trim() || voiceLines.move.trim() ||
+          voiceLines.entry.trim() || (fallbackDialogueLanguage === 'pt-BR'
+            ? 'Olá, esta é uma prévia da voz.'
+            : fallbackDialogueLanguage === 'es-ES'
+              ? 'Hola, esta es una prueba de voz.'
+              : 'Hello, this is a voice preview.');
+        const blob = await generateFreezoneKokoroSpeech(
+          previewText.slice(0, 120),
+          voiceId,
+          setAIVoiceStatus
+        );
+        if (aiVoiceUrlRef.current) URL.revokeObjectURL(aiVoiceUrlRef.current);
+        const url = URL.createObjectURL(blob);
+        aiVoiceUrlRef.current = url;
+        setAIVoiceReady(true);
+        const audio = aiVoiceAudioRef.current;
+        if (audio) {
+          audio.src = url;
+          audio.load();
+          await audio.play();
+        }
+        setAIVoiceStatus('Kokoro test voice played locally on this device.');
+      } catch (error) {
+        setAIVoiceStatus(error instanceof Error ? error.message : 'Kokoro test voice failed.');
+      }
+      return;
+    }
+    if (!('speechSynthesis' in window)) {
+      setAIVoiceStatus('Browser speech is unavailable for the selected fallback.');
+      return;
+    }
+    if (!voices.length) {
+      setAIVoiceStatus('No browser voices are available on this device yet.');
+      return;
+    }
+    const voice = resolveFreezoneVoice(voices, selectedVoiceURI);
+    if (selectedVoiceURI && !voice) {
+      setAIVoiceStatus('The selected browser fallback voice is unavailable on this device.');
+      return;
+    }
+    const utterance = new SpeechSynthesisUtterance('A voz de fallback está funcionando.');
+    utterance.lang = fallbackDialogueLanguage;
+    utterance.voice = voice || null;
+    window.speechSynthesis.speak(utterance);
+    setAIVoiceStatus('Fallback voice preview is playing locally on this device.');
+  };
+
+  const purchaseUpgrade = async (
+    type: FreezoneUpgrade,
+    payment: FreezoneUpgradePayment = 'orb',
+    showQuickFeedback = false
+  ) => {
+    if (showQuickFeedback) setQuickUpgradeFeedback('');
     const action = window.wizardChess?.upgradeFreezoneSkill;
     if (!action) {
-      setStatus('Freezone is still starting. Try again in a moment.');
+      const message = 'Freezone is still starting. Try again in a moment.';
+      setStatus(message);
+      if (showQuickFeedback) setQuickUpgradeFeedback(message);
       return;
     }
     setPurchaseBusy(true);
     try {
-      const result = await action(type);
-      setStatus(result.ok
-        ? `${FREEZONE_UPGRADES.find((upgrade) => upgrade.type === type)?.label} upgraded.`
-        : result.error || 'Could not purchase this upgrade.');
+      const result = await action(type, payment);
+      const message = result.ok
+        ? `${FREEZONE_UPGRADES.find((upgrade) => upgrade.type === type)?.label} upgraded with ${payment === 'xp' ? 'XP' : 'an orb'}.`
+        : result.error || 'Could not purchase this upgrade.';
+      setStatus(message);
+      if (showQuickFeedback) setQuickUpgradeFeedback(message);
       if (result.ok) emitTeamVoiceEvent('upgrade');
     } catch (error) {
-      setStatus(error instanceof Error ? error.message : 'Could not purchase this upgrade.');
+      const message = error instanceof Error ? error.message : 'Could not purchase this upgrade.';
+      setStatus(message);
+      if (showQuickFeedback) setQuickUpgradeFeedback(message);
     } finally {
       setPurchaseBusy(false);
     }
@@ -1444,6 +2266,29 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       effectiveTargetEnvelope.cols
     )
     : FREEZONE_ENVELOPE_ORB_COST;
+  const whiteOrbXpCost = hud
+    ? targetEnvelopeCost * (hud.economy.orbCosts.white ?? 0)
+    : 0;
+  const movementOrbXpCost = hud
+    ? FREEZONE_MOVEMENT_ORB_COST * (hud.economy.orbCosts.movement ?? 0)
+    : 0;
+  const canBuyEnvelopeWithCurrentResources = Boolean(
+    hud?.isPlayer && upgradeableEnvelopes.some((option) => {
+      const cost = getFreezoneEnvelopeUpgradeCost(
+        hud.envelopeRows,
+        hud.envelopeCols,
+        option.rows,
+        option.cols
+      );
+      return hud.orbBalances.white >= cost ||
+        hud.xp >= cost * (hud.economy.orbCosts.white ?? 0);
+    })
+  );
+  const canBuyMovementOffsetWithCurrentResources = Boolean(
+    hud?.isPlayer && hud.ownedPieces.length &&
+    (hud.orbBalances.movement >= FREEZONE_MOVEMENT_ORB_COST ||
+      hud.xp >= movementOrbXpCost)
+  );
   const selectedMovementPiece = hud?.ownedPieces.find(
     (piece) => piece.id === selectedMovementPieceId
   );
@@ -1465,7 +2310,56 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
   const movementExtraKeys = new Set(
     selectedMovementPiece?.unlockedMoves.map(([row, col]) => `${row},${col}`) || []
   );
-  const purchaseEnvelopeUpgrade = async () => {
+  const selectedAcquisitionPattern = hud?.pieceOptions.find(
+    (pattern) => pattern.id === selectedAcquisitionPatternId
+  );
+  const selectedPersonality = FREEZONE_PERSONALITIES.find(
+    (personality) => personality.id === selectedPersonalityId
+  );
+  const canAcquireArmyUnit = Boolean(
+    hud?.isPlayer &&
+    (hud.xp >= hud.xpCost || (hud.teamPieces.length > 0 && hud.xp >= hud.allyCost))
+  );
+  const upgradeXpCosts = hud ? {
+    red: hud.economy.orbCosts.red ?? 0,
+    blue: hud.economy.orbCosts.blue ?? 0,
+    yellow: hud.economy.orbCosts.yellow ?? 0,
+    purple: hud.economy.orbCosts.purple ?? 0,
+    white: hud.economy.orbCosts.white ?? 0
+  } : null;
+  const defaultUpgradePayment = (type: FreezoneUpgrade): FreezoneUpgradePayment =>
+    hud && hud.orbBalances[type] >= 1 ? 'orb' : 'xp';
+  const openQuickUpgradeStage = (stage: Exclude<FreezoneUpgradeModalStage, null>) => {
+    setStatus('');
+    setActiveShopTab('shop');
+    setUpgradeModalStage(stage);
+    setOpen(true);
+  };
+  const openMovementOffsetControls = () => {
+    setUpgradeModalStage(null);
+    setActiveShopTab('shop');
+    window.requestAnimationFrame(() => {
+      document.getElementById('freezone-movement-shop')?.scrollIntoView({
+        behavior: 'smooth',
+        block: 'center'
+      });
+    });
+  };
+  const acquireSelectedPattern = () => {
+    if (!selectedAcquisitionPattern) {
+      setStatus('No piece pattern is available right now.');
+      return;
+    }
+    void acquirePiece({
+      ...selectedAcquisitionPattern,
+      appearance,
+      name: pieceName.trim() || selectedAcquisitionPattern.name,
+      title: pieceTitle.trim() || selectedAcquisitionPattern.title,
+      catchphrase: pieceCatchphrase.trim() || selectedAcquisitionPattern.catchphrase,
+      personality: piecePersonality.trim() || selectedPersonality?.prompt || selectedAcquisitionPattern.personality
+    });
+  };
+  const purchaseEnvelopeUpgrade = async (payment: FreezoneUpgradePayment = 'orb') => {
     const action = window.wizardChess?.upgradeFreezoneEnvelope;
     if (!action) {
       setStatus('Freezone is still starting. Try again in a moment.');
@@ -1473,9 +2367,9 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     }
     setPurchaseBusy(true);
     try {
-      const result = await action(effectiveTargetEnvelope.rows, effectiveTargetEnvelope.cols);
+      const result = await action(effectiveTargetEnvelope.rows, effectiveTargetEnvelope.cols, payment);
       setStatus(result.ok
-        ? `Movement envelope upgraded to ${effectiveTargetEnvelope.rows}×${effectiveTargetEnvelope.cols}.`
+        ? `Movement envelope upgraded to ${effectiveTargetEnvelope.rows}×${effectiveTargetEnvelope.cols} with ${payment === 'xp' ? 'XP' : 'white orbs'}.`
         : result.error || 'Could not upgrade the movement envelope.');
       if (result.ok) emitTeamVoiceEvent('upgrade');
     } catch (error) {
@@ -1484,7 +2378,11 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       setPurchaseBusy(false);
     }
   };
-  const purchaseMovementOffset = async (row: number, col: number) => {
+  const purchaseMovementOffset = async (
+    row: number,
+    col: number,
+    payment: FreezoneUpgradePayment = movementPayment
+  ) => {
     const action = window.wizardChess?.unlockFreezoneMovement;
     if (!action || !selectedMovementPiece) {
       setStatus('Choose one of your pieces first.');
@@ -1499,7 +2397,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
         movementKind,
         effectiveMovementScope.rows,
         effectiveMovementScope.cols,
-        targetMovementA
+        targetMovementA,
+        payment
       );
       setStatus(result.ok
         ? `${movementKind} offset ${row}, ${col} ${result.addedOffset ? 'unlocked' : 'updated'} for ${selectedMovementPiece.name}.`
@@ -1522,12 +2421,6 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
     return () => window.removeEventListener('resize', updateCompactLeaderboard);
   }, []);
 
-  useEffect(() => {
-    if (!hud?.enabled) return undefined;
-    const timer = window.setInterval(() => setCooldownNow(Date.now()), 100);
-    return () => window.clearInterval(timer);
-  }, [hud?.enabled]);
-
   const roomLeaderboard: FreezoneRoomRankingEntry[] = hud?.roomLeaderboard?.length
     ? hud.roomLeaderboard
     : (hud?.onlinePlayers || []).map((player, index) => ({
@@ -1536,6 +2429,30 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       leader: index === 0,
       crown: index === 0
     }));
+  const incomingTeamInvitations = hud?.isPlayer
+    ? hud.freezoneAllianceInvitations.filter((invite) =>
+      invite.status === 'pending' && invite.toSide === hud.playerSide)
+    : [];
+  const inspectedSide = inspectedPiece?.side;
+  const inspectedRelation = inspectedSide !== undefined && hud
+    ? hud.freezoneRelations.find((relation) =>
+      (relation.sideA === hud.playerSide && relation.sideB === inspectedSide) ||
+      (relation.sideB === hud.playerSide && relation.sideA === inspectedSide)
+    )
+    : undefined;
+  const incomingAlliance = inspectedSide !== undefined
+    ? incomingTeamInvitations.find((invite) => invite.fromSide === inspectedSide)
+    : undefined;
+  const outgoingAlliance = inspectedSide !== undefined && hud
+    ? hud.freezoneAllianceInvitations.some((invite) =>
+      invite.status === 'pending' &&
+      invite.fromSide === hud.playerSide &&
+      invite.toSide === inspectedSide
+    )
+    : false;
+  const inspectedPlayer = inspectedSide !== undefined
+    ? hud?.onlinePlayers.find((player) => player.side === inspectedSide)
+    : undefined;
 
   return (
     <>
@@ -1546,7 +2463,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
             aria-label="Freezone room ranking"
           >
             <div className="freezone-room-ranking-header">
-              <strong>Room rank</strong>
+              <strong>ROOM RANK</strong>
               {compactLeaderboard && (
                 <button
                   type="button"
@@ -1557,6 +2474,24 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 </button>
               )}
             </div>
+            {incomingTeamInvitations.map((invite) => (
+              <div className="freezone-alliance-inbox" key={invite.id}>
+                <span>
+                  {hud.onlinePlayers.find((player) => player.side === invite.fromSide)?.name ||
+                    `Team ${invite.fromSide + 1}`} invites your team to an alliance
+                </span>
+                <button
+                  type="button"
+                  disabled={relationBusy}
+                  onClick={() => void changeTeamRelation(invite.fromSide, 'accept', invite.id)}
+                >Accept</button>
+                <button
+                  type="button"
+                  disabled={relationBusy}
+                  onClick={() => void changeTeamRelation(invite.fromSide, 'decline', invite.id)}
+                >Decline</button>
+              </div>
+            ))}
             {!rankingCollapsed && (
               <div className="freezone-room-ranking-list">
                 {roomLeaderboard.length ? roomLeaderboard.map((player) => (
@@ -1564,17 +2499,39 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                     key={player.side}
                     className={`freezone-room-ranking-row ${player.leader ? 'leader' : ''}`}
                   >
-                    <span className="freezone-room-ranking-position">{player.position || 1}</span>
-                    <span className="freezone-room-ranking-name">
-                      {player.leader ? '👑 ' : ''}{player.name}
+                    <span
+                      className="freezone-room-ranking-position"
+                      aria-label={`Place ${player.position || 1}`}
+                    >
+                      {player.position || 1}
                     </span>
-                    <span className="freezone-room-ranking-metric">K {player.kills ?? 0}</span>
-                    <span className="freezone-room-ranking-metric">XP {player.xp ?? 0}</span>
-                    <span className="freezone-room-ranking-metric">Orb {player.orbsCollected ?? 0}</span>
-                    <span className="freezone-room-ranking-metric">Pieces {player.pieces ?? 0}</span>
-                    <span className="freezone-room-ranking-time">
-                      {player.timeLabel || formatFreezoneSessionAge(player.sessionStartedAt || Date.now())}
-                    </span>
+                    <div className="freezone-room-ranking-details">
+                      <div className="freezone-room-ranking-identity">
+                        <span className="freezone-room-ranking-name" title={player.name}>
+                          {player.name}
+                        </span>
+                        {player.crown && (
+                          <span className="freezone-room-ranking-crown" aria-label="Rank leader">♛</span>
+                        )}
+                      </div>
+                      <div className="freezone-room-ranking-stats">
+                        <span className="freezone-room-ranking-metric kills">
+                          <span aria-hidden="true">⚔</span> K {formatFreezoneRankingNumber(player.kills)}
+                        </span>
+                        <span className="freezone-room-ranking-metric xp">
+                          <span aria-hidden="true">◆</span> XP {formatFreezoneRankingNumber(player.xp)}
+                        </span>
+                        <span className="freezone-room-ranking-metric orbs">
+                          <span aria-hidden="true">●</span> Orb {formatFreezoneRankingNumber(player.orbsCollected)}
+                        </span>
+                        <span className="freezone-room-ranking-metric pieces">
+                          <span aria-hidden="true">♟</span> {formatFreezoneRankingNumber(player.pieces)}
+                        </span>
+                        <span className="freezone-room-ranking-time">
+                          {player.timeLabel || formatFreezoneSessionAge(player.sessionStartedAt || Date.now())}
+                        </span>
+                      </div>
+                    </div>
                   </div>
                 )) : (
                   <div className="freezone-room-empty">No players online.</div>
@@ -1582,66 +2539,51 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
               </div>
             )}
           </aside>
-          <aside className="freezone-piece-cooldowns" aria-label="Your pieces and cooldown energy">
-            <strong>My pieces</strong>
-            {hud.teamPieces.length ? hud.teamPieces.map((piece) => {
-              const remaining = Math.max(0, piece.readyAt - cooldownNow);
-              const duration = Math.max(1, piece.cooldownDurationMs);
-              const energy = Math.max(0, Math.min(100, 100 * (1 - remaining / duration)));
-              const icon = {
-                pawn: '♟',
-                knight: '♞',
-                bishop: '♝',
-                rook: '♜',
-                queen: '♛',
-                king: '♚'
-              }[piece.type] || '♟';
-              return (
-                <div className="freezone-piece-cooldown" key={piece.id}>
-                  <span className="freezone-piece-cooldown-name" title={piece.name}>
-                    <i aria-hidden="true">{icon}</i>{piece.name}
-                    {piece.ally ? <small>Bot</small> : null}
-                  </span>
-                  <span
-                    className="freezone-energy-track"
-                    role="progressbar"
-                    aria-label={`${piece.name} cooldown energy`}
-                    aria-valuemin={0}
-                    aria-valuemax={100}
-                    aria-valuenow={Math.round(energy)}
-                  >
-                    <i style={{ width: `${energy}%` }} />
-                  </span>
-                  <small>{remaining ? `${(remaining / 1000).toFixed(1)}s` : 'Ready'}</small>
-                </div>
-              );
-            }) : <span className="freezone-piece-cooldown-empty">No pieces</span>}
-          </aside>
+          {hud && upgradeXpCosts && (
+            <FreezonePieceCooldowns
+              pieces={hud.teamPieces}
+              hud={hud}
+              canAcquireArmyUnit={canAcquireArmyUnit}
+              canBuyMobility={canBuyEnvelopeWithCurrentResources || canBuyMovementOffsetWithCurrentResources}
+              purchaseBusy={purchaseBusy}
+              upgradeXpCosts={upgradeXpCosts}
+              feedback={quickUpgradeFeedback}
+              onUpgrade={(type) => void purchaseUpgrade(type, defaultUpgradePayment(type), true)}
+              onAcquire={() => openQuickUpgradeStage('acquire-choice')}
+              onMobility={() => openQuickUpgradeStage('mobility')}
+            />
+          )}
           <div className="freezone-hud" aria-live="polite">
-          <span className="freezone-hud-stats">
-            XP {hud.xp} · Army {hud.pieces}/{hud.capacity} ·
-            🔴 {hud.orbBalances.red} · 🔵 {hud.orbBalances.blue} ·
-            🟡 {hud.orbBalances.yellow} · ⚪ {hud.orbBalances.white} ·
-            🟣 {hud.orbBalances.purple} · 🟠 {hud.orbBalances.movement} ·
-            🟢 {hud.orbBalances.bot} · Bots {hud.allies.length}
-          </span>
-          <span className="freezone-hud-player">
-            {hud.playerName}{hud.selectedPieceName ? ` · Selected: ${hud.selectedPieceName}` : ''}
-          </span>
-          <div className="freezone-online-roster" aria-label="Players currently online">
-            <strong>Online {hud.onlinePlayers.length} · Max {hud.maxPlayers}</strong>
-            {hud.onlinePlayers.map((player) => (
-              <span key={player.side}>
-                {player.name} · Team {player.side + 1}{player.bot ? ' · Bot' : ''} · Online · {player.playing ? 'Playing' : 'Not playing'}
-              </span>
-            ))}
-            {hud.alliedBots.map((ally) => (
-              <span key={ally.id}>
-                {ally.name} · Team {ally.side + 1} · Allied bot · {FREEZONE_ALLY_LABELS[ally.role]} · {ally.playing ? 'Playing' : 'Not playing'}
-              </span>
-            ))}
-          </div>
-          {roomCode && hud.isPlayer && (
+          {displayPreferences.freezoneStats && (
+            <span className="freezone-hud-stats">
+              XP {hud.xp} · Army {hud.pieces}/{hud.capacity} ·
+              🔴 {hud.orbBalances.red} · 🔵 {hud.orbBalances.blue} ·
+              🟡 {hud.orbBalances.yellow} · ⚪ {hud.orbBalances.white} ·
+              🟣 {hud.orbBalances.purple} · 🟠 {hud.orbBalances.movement} ·
+              🟢 {hud.orbBalances.bot} · Bots {hud.allies.length}
+            </span>
+          )}
+          {displayPreferences.freezonePlayer && (
+            <span className="freezone-hud-player">
+              {hud.playerName}{hud.selectedPieceName ? ` · Selected: ${hud.selectedPieceName}` : ''}
+            </span>
+          )}
+          {displayPreferences.freezoneOnlineRoster && (
+            <div className="freezone-online-roster" aria-label="Players currently online">
+              <strong>Online {hud.onlinePlayers.length} · Max {hud.maxPlayers}</strong>
+              {hud.onlinePlayers.map((player) => (
+                <span key={player.side}>
+                  {player.name} · Team {player.side + 1}{player.bot ? ' · Bot' : ''} · Online · {player.playing ? 'Playing' : 'Not playing'}
+                </span>
+              ))}
+              {hud.alliedBots.map((ally) => (
+                <span key={ally.id}>
+                  {ally.name} · Team {ally.side + 1} · Allied bot · {FREEZONE_ALLY_LABELS[ally.role]} · {ally.playing ? 'Playing' : 'Not playing'}
+                </span>
+              ))}
+            </div>
+          )}
+          {displayPreferences.freezoneAdversaryBots && roomCode && hud.isPlayer && (
             <label className="freezone-hud-bots">
               <input
                 type="checkbox"
@@ -1653,19 +2595,21 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
               <span>Adversary bots · {hud.onlinePlayers.filter((player) => player.bot).length}/2</span>
             </label>
           )}
-          <button
-            type="button"
-            className={`hud-btn freezone-radio-toggle ${sharedMusicPlaying ? 'playing' : ''}`}
-            aria-label="Configure shared Freezone radio"
-            aria-expanded={radioOpen}
-            onClick={() => {
-              setStatus('');
-              setRadioOpen((value) => !value);
-            }}
-          >
-            ♫ {sharedMusicPlaying ? 'On' : 'Radio'}
-          </button>
-          {radioOpen && (
+          {displayPreferences.freezoneRadio && (
+            <button
+              type="button"
+              className={`hud-btn freezone-radio-toggle ${sharedMusicPlaying ? 'playing' : ''}`}
+              aria-label="Configure shared Freezone radio"
+              aria-expanded={radioOpen}
+              onClick={() => {
+                setStatus('');
+                setRadioOpen((value) => !value);
+              }}
+            >
+              ♫ {sharedMusicPlaying ? 'On' : 'Radio'}
+            </button>
+          )}
+          {displayPreferences.freezoneRadio && radioOpen && (
             <div className="freezone-radio-popover" role="group" aria-label="Shared room radio">
               <label>
                 Shared radio / audio URL
@@ -1699,15 +2643,25 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
               {status && <p role="status" aria-live="polite">{status}</p>}
             </div>
           )}
+          {displayPreferences.freezonePieceShop && (
+            <button
+              type="button"
+              className="hud-btn freezone-open"
+              onClick={() => {
+                setStatus('');
+                setOpen(true);
+              }}
+            >
+              Piece Shop
+            </button>
+          )}
           <button
             type="button"
-            className="hud-btn freezone-open"
-            onClick={() => {
-              setStatus('');
-              setOpen(true);
-            }}
+            className="hud-btn freezone-display-settings"
+            aria-label="Open display settings"
+            onClick={onOpenDisplaySettings}
           >
-            Piece Shop
+            ⚙ Display
           </button>
         </div>
       </>
@@ -1771,28 +2725,28 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                 <span><strong>{hud.allies.length}</strong> allied bots</span>
                 <span><strong>{hud.pieces}/{hud.capacity}</strong> pieces</span>
                 <span><strong>{hud.xpCost}</strong> XP per piece</span>
-                <span>
-                  <strong>
-                    {hud.cooldownMs > 0
-                      ? `${Math.ceil(hud.cooldownMs / 1000)}s`
-                      : `${Math.max(0, hud.movesPerCycle - hud.movesUsed)}/${hud.movesPerCycle}`}
-                  </strong>
-                  {hud.cooldownMs > 0 ? ' resting' : ' actions left'}
-                </span>
+                <FreezoneHudTimers
+                  cooldownMs={hud.cooldownMs}
+                  movesPerCycle={hud.movesPerCycle}
+                  mutantZone={hud.mutantZone}
+                />
                 <span><strong>{(hud.cooldownDurationMs / 1000).toFixed(1)}s</strong> cooldown</span>
                 <span><strong>{hud.envelopeRows}×{hud.envelopeCols}</strong> movement envelope</span>
                 <span><strong>{Math.max(0, hud.stepBudget - hud.stepsUsed)}/{hud.stepBudget}</strong> unit steps left</span>
-                {hud.mutantZone && (
-                  <span className="freezone-mutant-summary">
-                    <strong>{hud.mutantZone.shape}</strong> mutates · {Math.ceil(hud.mutantZone.remainingMs / 1000)}s left
-                  </span>
-                )}
                 {roomCode && (
                   <button type="button" onClick={() => void copyRoomCode()}>
                     Arena {roomCode} · Copy
                   </button>
                 )}
               </div>
+              <button
+                type="button"
+                className="freezone-upgrade-launch"
+                onClick={() => setUpgradeModalStage('upgrades')}
+              >
+                Upgrade your army
+                <span>View spheres, XP options, and movement upgrades</span>
+              </button>
               <div className="freezone-room-presence" aria-label="Room players and controls">
                 <strong>Players online: {hud.onlinePlayers.length} · Maximum seats: {hud.maxPlayers}</strong>
                 {hud.onlinePlayers.length ? hud.onlinePlayers.map((player) => (
@@ -1929,76 +2883,25 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
               ) : hud.pieces >= hud.capacity ? (
                 <p className="freezone-hint">Army full: choose a non-king piece to replace or buy an army-capacity upgrade with a purple orb.</p>
               ) : null}
-              <div className="freezone-orb-guide" aria-label="Orb effects">
-                {hud.orbEffects.map((orb) => (
-                  <span key={orb.type}>
-                    <i style={{ backgroundColor: orb.color }} />
-                    <strong>{orb.label}</strong> {orb.description}
-                    <small>
-                      Balance: {hud.orbBalances[orb.type]}
-                      {orb.type !== 'xp' && orb.type !== 'bot' && orb.type !== 'movement' &&
-                        ` · Lv ${hud.upgradeLevels[orb.type]}`}
-                    </small>
-                  </span>
-                ))}
-              </div>
-              <div className="freezone-upgrades" aria-label="Explicit skill upgrades">
-                <h3>Spend an orb to upgrade</h3>
-                {FREEZONE_UPGRADES.map((upgrade) => (
-                  <div className="freezone-upgrade" key={upgrade.type}>
-                    <span>
-                      <strong>{upgrade.label}</strong>
-                      <small>{upgrade.description} · {hud.orbBalances[upgrade.type]} available</small>
-                    </span>
-                    <button
-                      type="button"
-                      disabled={!hud.isPlayer || purchaseBusy || !hud.canUpgrade[upgrade.type] ||
-                        hud.orbBalances[upgrade.type] < 1}
-                      onClick={() => void purchaseUpgrade(upgrade.type)}
-                    >
-                      {hud.canUpgrade[upgrade.type] ? 'Spend 1 orb' : 'Max level'}
-                    </button>
-                  </div>
-                ))}
-                <div className="freezone-upgrade">
-                  <span>
-                    <strong>Movement envelope</strong>
-                    <small>Costs {FREEZONE_ENVELOPE_ORB_COST} white orbs per scope level · {hud.orbBalances.white} available</small>
-                  </span>
-                  <select
-                    value={`${effectiveTargetEnvelope.rows}x${effectiveTargetEnvelope.cols}`}
-                    onChange={(event) => {
-                      const [rows, cols] = event.target.value.split('x').map(Number);
-                      setTargetEnvelope({ rows, cols });
-                    }}
-                    disabled={!upgradeableEnvelopes.length}
-                    aria-label="Choose movement envelope upgrade"
-                  >
-                    {upgradeableEnvelopes.map((option) => (
-                      <option key={`${option.rows}x${option.cols}`} value={`${option.rows}x${option.cols}`}>
-                        {option.rows}×{option.cols}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    disabled={!hud.isPlayer || purchaseBusy || !upgradeableEnvelopes.length ||
-                      hud.orbBalances.white < targetEnvelopeCost}
-                    onClick={() => void purchaseEnvelopeUpgrade()}
-                  >
-                    {upgradeableEnvelopes.length
-                      ? `Spend ${targetEnvelopeCost} white orb${targetEnvelopeCost === 1 ? '' : 's'}`
-                      : 'Max envelope'}
-                  </button>
-                </div>
-              </div>
-              <section className="freezone-movement-shop" aria-label="Unlock piece movement cards">
-                <h3>Unlock movement cards · {FREEZONE_MOVEMENT_ORB_COST} movement orb each</h3>
+              <section id="freezone-movement-shop" className="freezone-movement-shop" aria-label="Unlock piece movement cards">
+                <h3>Unlock movement cards</h3>
                 <p className="freezone-hint">
                   A counts only extra offsets bought for the selected piece. Its standard movements stay free.
                   Changing an offset between drag, jump, and teleport replaces its type and does not increase A.
+                  Each new offset costs {FREEZONE_MOVEMENT_ORB_COST} movement orb or {movementOrbXpCost} XP.
                 </p>
                 <div className="freezone-movement-controls">
+                  <label>
+                    Pay with
+                    <select
+                      value={movementPayment}
+                      onChange={(event) => setMovementPayment(event.target.value as FreezoneUpgradePayment)}
+                      disabled={!hud.isPlayer || purchaseBusy}
+                    >
+                      <option value="orb">Movement orbs · {hud.orbBalances.movement} available</option>
+                      <option value="xp">XP · {hud.xp} available</option>
+                    </select>
+                  </label>
                   <label>
                     Piece
                     <select
@@ -2081,8 +2984,11 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                       ) ? 'jump' : 'drag';
                       const sameType = alreadyAvailable && currentKind === movementKind;
                       const needsA = !alreadyAvailable;
+                      const canPayMovement = movementPayment === 'xp'
+                        ? hud.xp >= movementOrbXpCost
+                        : hud.orbBalances.movement >= FREEZONE_MOVEMENT_ORB_COST;
                       const canUnlock = hud.isPlayer && !purchaseBusy &&
-                        hud.orbBalances.movement >= FREEZONE_MOVEMENT_ORB_COST &&
+                        canPayMovement &&
                         (!needsA || movementOffsetCount < targetMovementA) &&
                         (!isCenter || movementKind === 'teleport') &&
                         !sameType;
@@ -2094,7 +3000,7 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                           aria-label={`${isCenter ? 'Same-square' : `${row}, ${col}`} ${movementKind} movement${alreadyAvailable ? `; currently ${currentKind}` : ''}`}
                           title={alreadyAvailable
                             ? `${isExtra ? 'Extra offset' : 'Standard movement'} · ${currentKind}${sameType ? '' : ` · change to ${movementKind}`}`
-                            : `${movementKind} offset ${row}, ${col}`}
+                            : `${movementKind} offset ${row}, ${col} · ${movementPayment === 'xp' ? `${movementOrbXpCost} XP` : `${FREEZONE_MOVEMENT_ORB_COST} movement orb`}`}
                           disabled={!canUnlock}
                           onClick={() => void purchaseMovementOffset(row, col)}
                         >
@@ -2148,14 +3054,45 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                       ))}
                     </select>
                   </label>
-                  <label>
-                    AI character voice for this piece
-                    <select value={pieceAIVoice} onChange={(event) => setPieceAIVoice(event.target.value)}>
-                      {FREEZONE_AI_VOICES.map(({ id, label }) => (
-                        <option value={id} key={id}>{label}</option>
-                      ))}
-                    </select>
-                  </label>
+                  {aiSettings.voiceProvider === 'qwen3-tts' && (
+                    <label>
+                      Qwen voice for this piece
+                      <select value={pieceQwenVoice} onChange={(event) => setPieceQwenVoice(event.target.value)}>
+                        <option value="">Use AI & APIs default</option>
+                        {FREEZONE_QWEN_VOICES.map(({ id, label }) => (
+                          <option value={id} key={id}>{label}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                  {(aiSettings.voiceProvider === 'kokoro' ||
+                    (aiVoiceMode === 'fallback' && fallbackVoiceEngine === 'kokoro')) && (
+                    <label>
+                      Kokoro voice for this piece
+                      <select value={pieceKokoroVoice} onChange={(event) => setPieceKokoroVoice(event.target.value)}>
+                        <option value="">Use selected Kokoro default</option>
+                        {FREEZONE_KOKORO_VOICES
+                          .filter(({ id }) => (aiVoiceMode === 'tts' &&
+                            aiSettings.voiceProvider === 'kokoro') ||
+                            FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(id))
+                          .map(({ id, label }) => (
+                          <option value={id} key={id}>{label}</option>
+                          ))}
+                      </select>
+                    </label>
+                  )}
+                  {aiSettings.voiceProvider !== 'qwen3-tts' &&
+                    aiSettings.voiceProvider !== 'kokoro' &&
+                    !(aiVoiceMode === 'fallback' && fallbackVoiceEngine === 'kokoro') && (
+                    <label>
+                      AI character voice for this piece
+                      <select value={pieceAIVoice} onChange={(event) => setPieceAIVoice(event.target.value)}>
+                        {FREEZONE_AI_VOICES.map(({ id, label }) => (
+                          <option value={id} key={id}>{label}</option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
                   <label className="freezone-field-wide">
                     Public phrase
                     <input value={pieceCatchphrase} maxLength={120} placeholder="Always defeats my opponents" onChange={(event) => setPieceCatchphrase(event.target.value)} />
@@ -2167,10 +3104,6 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                     <p className="freezone-hint">Speech synthesis is not supported in this browser.</p>
                   ) : (
                     <>
-                      <label className="freezone-local-toggle">
-                        <input type="checkbox" checked={voiceEnabled} onChange={(event) => setVoiceEnabled(event.target.checked)} />
-                        Enable local speech for public piece lines
-                      </label>
                       <label>
                         Browser voice
                         <select value={selectedVoiceURI} onChange={(event) => setSelectedVoiceURI(event.target.value)}>
@@ -2193,17 +3126,33 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   )}
                   <div className="freezone-voice-lines">
                     {FREEZONE_VOICE_EVENTS.map((event) => (
-                      <label key={event.id}>
-                        {event.label}
-                        <input
-                          value={voiceLines[event.id as VoiceEventKey]}
-                          maxLength={120}
-                          onChange={(change) => setVoiceLines((current) => ({
-                            ...current,
-                            [event.id]: change.target.value.slice(0, 120)
-                          }))}
-                        />
-                      </label>
+                      <div className="freezone-voice-line" key={event.id}>
+                        <label htmlFor={`voice-line-${event.id}`}>{event.label}</label>
+                        <div className="freezone-voice-line-control">
+                          <input
+                            id={`voice-line-${event.id}`}
+                            value={voiceLines[event.id as VoiceEventKey]}
+                            maxLength={120}
+                            onChange={(change) => setVoiceLines((current) => ({
+                              ...current,
+                              [event.id]: change.target.value.slice(0, 120)
+                            }))}
+                          />
+                          <button
+                            type="button"
+                            className="freezone-voice-preview"
+                            aria-label={`Preview ${event.label} voice line`}
+                            title="Listen to this phrase with the local browser voice"
+                            disabled={!voiceLines[event.id as VoiceEventKey].trim()}
+                            onClick={() => previewPieceVoiceLine(voiceLines[event.id as VoiceEventKey])}
+                          >
+                            <svg viewBox="0 0 24 24" aria-hidden="true">
+                              <rect x="9" y="3" width="6" height="12" rx="3" />
+                              <path d="M5 11a7 7 0 0 0 14 0M12 18v3m-4 0h8" />
+                            </svg>
+                          </button>
+                        </div>
+                      </div>
                     ))}
                   </div>
                 </details>
@@ -2434,6 +3383,8 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                       personality: piecePersonality.trim(),
                       language: pieceLanguage,
                       aiVoice: pieceAIVoice,
+                      qwenVoice: pieceQwenVoice,
+                      kokoroVoice: pieceKokoroVoice,
                       voiceLines,
                       type: pieceType,
                       moves: selectedMoves,
@@ -2454,10 +3405,6 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                   <p className="freezone-hint">
                     Recruitment costs XP once. Editing a unit profile never charges XP or orbs.
                   </p>
-                  <label className="freezone-local-toggle">
-                    <input type="checkbox" checked={voiceEnabled} onChange={(event) => setVoiceEnabled(event.target.checked)} />
-                    Enable local speech for piece voice lines on this device
-                  </label>
                   <p className="freezone-hint">
                     Text bubbles can appear while speech is off. Configure AI movement, dialogue, and voice separately in AI & APIs.
                   </p>
@@ -2520,14 +3467,45 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                             ))}
                           </select>
                         </label>
-                        <label>
-                          Character voice
-                          <select value={pieceAIVoice} onChange={(event) => setPieceAIVoice(event.target.value)}>
-                            {FREEZONE_AI_VOICES.map(({ id, label }) => (
-                              <option value={id} key={id}>{label}</option>
-                            ))}
-                          </select>
-                        </label>
+                        {aiSettings.voiceProvider === 'qwen3-tts' && (
+                          <label>
+                            Qwen voice
+                            <select value={pieceQwenVoice} onChange={(event) => setPieceQwenVoice(event.target.value)}>
+                              <option value="">Use AI & APIs default</option>
+                              {FREEZONE_QWEN_VOICES.map(({ id, label }) => (
+                                <option value={id} key={id}>{label}</option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+                        {(aiSettings.voiceProvider === 'kokoro' ||
+                          (aiVoiceMode === 'fallback' && fallbackVoiceEngine === 'kokoro')) && (
+                          <label>
+                            Kokoro voice
+                            <select value={pieceKokoroVoice} onChange={(event) => setPieceKokoroVoice(event.target.value)}>
+                              <option value="">Use selected Kokoro default</option>
+                              {FREEZONE_KOKORO_VOICES
+                                .filter(({ id }) => (aiVoiceMode === 'tts' &&
+                                  aiSettings.voiceProvider === 'kokoro') ||
+                                  FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(id))
+                                .map(({ id, label }) => (
+                                <option value={id} key={id}>{label}</option>
+                                ))}
+                            </select>
+                          </label>
+                        )}
+                        {aiSettings.voiceProvider !== 'qwen3-tts' &&
+                          aiSettings.voiceProvider !== 'kokoro' &&
+                          !(aiVoiceMode === 'fallback' && fallbackVoiceEngine === 'kokoro') && (
+                          <label>
+                            Character voice
+                            <select value={pieceAIVoice} onChange={(event) => setPieceAIVoice(event.target.value)}>
+                              {FREEZONE_AI_VOICES.map(({ id, label }) => (
+                                <option value={id} key={id}>{label}</option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
                         <label className="freezone-field-wide">
                           Public description
                           <textarea value={pieceDescription} maxLength={160} onChange={(event) => setPieceDescription(event.target.value)} />
@@ -2540,22 +3518,43 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                           Public phrase
                           <input value={pieceCatchphrase} maxLength={120} onChange={(event) => setPieceCatchphrase(event.target.value)} />
                         </label>
+                        <button type="button" onClick={() => void previewPieceVoice()}>
+                          Test selected voice
+                        </button>
                         {FREEZONE_VOICE_EVENTS.map((event) => (
-                          <label key={event.id}>
-                            {event.label}
-                            <input
-                              value={voiceLines[event.id as VoiceEventKey]}
-                              maxLength={120}
-                              onChange={(change) => setVoiceLines((current) => ({
-                                ...current,
-                                [event.id]: change.target.value.slice(0, 120)
-                              }))}
-                            />
-                          </label>
+                          <div className="freezone-voice-line" key={event.id}>
+                            <label htmlFor={`edit-voice-line-${event.id}`}>{event.label}</label>
+                            <div className="freezone-voice-line-control">
+                              <input
+                                id={`edit-voice-line-${event.id}`}
+                                value={voiceLines[event.id as VoiceEventKey]}
+                                maxLength={120}
+                                onChange={(change) => setVoiceLines((current) => ({
+                                  ...current,
+                                  [event.id]: change.target.value.slice(0, 120)
+                                }))}
+                              />
+                              <button
+                                type="button"
+                                className="freezone-voice-preview"
+                                aria-label={`Preview ${event.label} voice line`}
+                                title="Listen to this phrase with the local browser voice"
+                                disabled={!voiceLines[event.id as VoiceEventKey].trim()}
+                                onClick={() => previewPieceVoiceLine(voiceLines[event.id as VoiceEventKey])}
+                              >
+                                <svg viewBox="0 0 24 24" aria-hidden="true">
+                                  <rect x="9" y="3" width="6" height="12" rx="3" />
+                                  <path d="M5 11a7 7 0 0 0 14 0M12 18v3m-4 0h8" />
+                                </svg>
+                              </button>
+                            </div>
+                          </div>
                         ))}
                       </div>
                       <div className="freezone-profile-actions">
-                        <button type="button" onClick={previewPieceVoice}>Preview locally</button>
+                        <button type="button" onClick={() => void previewPieceVoice()}>
+                          Test selected voice
+                        </button>
                         <button type="submit" disabled={purchaseBusy}>Save profile</button>
                       </div>
                     </form>
@@ -2635,48 +3634,71 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                         Use AI for my purchased bots
                       </label>
                       <p className="freezone-hint">
-                        Pieces tagged “AI” may be moved by the assistant. Select one to take control; the AI then waits 20 seconds after your last move or selection before moving another piece. Purchased bots can act as soon as they are ready.
+                        Pieces tagged “AI” may be moved by the assistant. Select one to take control; the AI then waits 20 seconds after your last move or selection before moving another piece.
+                      </p>
+                      <p className="freezone-hint">
+                        Purchased and adversary bots take turns every 6–9 seconds when a legal move is ready. Existing army and piece cooldowns still apply.
                       </p>
                       <label>
-                        Provider
+                        Movement source
                         <select
-                          value={aiSettings.movementProvider}
-                          onChange={(event) => updateAITextProvider('movement', event.target.value as FreezoneTextProvider)}
+                          value={aiMovementMode}
+                          onChange={(event) => setAIMovementMode(
+                            event.target.value as 'provider' | 'local'
+                          )}
                         >
-                          <option value="openrouter">OpenRouter</option>
-                          <option value="gemini">Gemini</option>
-                          <option value="openai">OpenAI</option>
-                          <option value="deepseek">DeepSeek</option>
+                          <option value="provider">AI provider</option>
+                          <option value="local">Local fallback · no API</option>
                         </select>
                       </label>
-                      <label>
-                        Model ID
-                        <input
-                          list="freezone-movement-models"
-                          value={aiSettings.movementModel}
-                          maxLength={128}
-                          onChange={(event) => updateAISettings({ movementModel: event.target.value })}
-                          placeholder="deepseek/deepseek-v4.1-flash"
-                        />
-                        <datalist id="freezone-movement-models">
-                          <option value="deepseek/deepseek-v4.1-flash" />
-                          <option value="openrouter/free" />
-                          <option value="gemini-2.5-flash" />
-                          <option value="gpt-4o-mini" />
-                          <option value="deepseek-flash" />
-                        </datalist>
-                      </label>
-                      <label>
-                        API key (optional)
-                        <input
-                          type="password"
-                          autoComplete="new-password"
-                          maxLength={512}
-                          value={aiSettings.serviceApiKeys.movement}
-                          onChange={(event) => updateAIServiceKey('movement', event.target.value)}
-                          placeholder="Vazio usa a chave configurada no servidor"
-                        />
-                      </label>
+                      {aiMovementMode === 'local' ? (
+                        <p className="freezone-hint">
+                          Uses a fast local legal-move strategy for AI-controlled pieces. Separate dialogue and speech settings still apply.
+                        </p>
+                      ) : (
+                        <>
+                          <label>
+                            Provider
+                            <select
+                              value={aiSettings.movementProvider}
+                              onChange={(event) => updateAITextProvider('movement', event.target.value as FreezoneTextProvider)}
+                            >
+                              <option value="openrouter">OpenRouter</option>
+                              <option value="gemini">Gemini</option>
+                              <option value="openai">OpenAI</option>
+                              <option value="deepseek">DeepSeek</option>
+                            </select>
+                          </label>
+                          <label>
+                            Model ID
+                            <input
+                              list="freezone-movement-models"
+                              value={aiSettings.movementModel}
+                              maxLength={128}
+                              onChange={(event) => updateAISettings({ movementModel: event.target.value })}
+                              placeholder="deepseek/deepseek-v4.1-flash"
+                            />
+                            <datalist id="freezone-movement-models">
+                              <option value="deepseek/deepseek-v4.1-flash" />
+                              <option value="openrouter/free" />
+                              <option value="gemini-2.5-flash" />
+                              <option value="gpt-4o-mini" />
+                              <option value="deepseek-flash" />
+                            </datalist>
+                          </label>
+                          <label>
+                            API key (optional)
+                            <input
+                              type="password"
+                              autoComplete="new-password"
+                              maxLength={512}
+                              value={aiSettings.serviceApiKeys.movement}
+                              onChange={(event) => updateAIServiceKey('movement', event.target.value)}
+                              placeholder="Vazio usa a chave configurada no servidor"
+                            />
+                          </label>
+                        </>
+                      )}
                       <div className="freezone-ai-test-row">
                         <button
                           type="button"
@@ -2703,6 +3725,17 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                       <p className="freezone-hint">
                         Turn this off to keep AI movement without making a separate dialogue request. If provider and model match movement, one request handles both.
                       </p>
+                      <label>
+                        Local fallback and bot dialogue language
+                        <select
+                          value={fallbackDialogueLanguage}
+                          onChange={(event) => setFallbackDialogueLanguage(event.target.value)}
+                        >
+                          {FREEZONE_AI_LANGUAGES.map(({ id, label }) => (
+                            <option value={id} key={id}>{label}</option>
+                          ))}
+                        </select>
+                      </label>
                       <label>
                         Provider
                         <select
@@ -2764,64 +3797,219 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
                           checked={aiVoiceEnabled}
                           onChange={(event) => setAIVoiceEnabled(event.target.checked)}
                         />
-                        Enable AI-generated speech on this device
+                        Enable generated character speech
                       </label>
-                      <label>
-                        Voice provider
-                        <select
-                          value={aiSettings.voiceProvider}
-                          onChange={(event) => updateAISpeechProvider(event.target.value as FreezoneSpeechProvider)}
-                        >
-                          <option value="gemini-live">Gemini Live</option>
-                          <option value="gemini-tts">Gemini TTS</option>
-                          <option value="openai-tts">OpenAI TTS</option>
-                          <option value="google-tts">Google Cloud TTS</option>
-                        </select>
+                      <label className="freezone-local-toggle">
+                        <input
+                          type="checkbox"
+                          checked={voiceEnabled}
+                          disabled={aiVoiceEnabled}
+                          onChange={(event) => setVoiceEnabled(event.target.checked)}
+                        />
+                        Enable local browser speech for custom piece phrases
                       </label>
-                      {aiSettings.voiceProvider !== 'google-tts' && (
-                        <label>
-                          Voice model ID
-                          <input
-                            value={aiSettings.voiceModel}
-                            maxLength={128}
-                            onChange={(event) => updateAISettings({ voiceModel: event.target.value })}
-                            placeholder={FREEZONE_SPEECH_MODEL_DEFAULTS[aiSettings.voiceProvider as FreezoneSpeechProvider]}
-                          />
-                        </label>
+                      {aiVoiceEnabled && (
+                        <p className="freezone-hint">
+                          Turn off generated speech to use custom phrases with the selected local browser voice.
+                        </p>
                       )}
                       <label>
-                        Voice API key (optional)
-                        <input
-                          type="password"
-                          autoComplete="new-password"
-                          maxLength={512}
-                          value={aiSettings.serviceApiKeys.speech}
-                          onChange={(event) => updateAIServiceKey('speech', event.target.value)}
-                          placeholder="Vazio usa a chave configurada no servidor"
-                        />
-                      </label>
-                      <div className="freezone-ai-test-row">
-                        <button
-                          type="button"
-                          disabled={aiServiceStatuses.speech?.state === 'checking'}
-                          onClick={() => void testAIService('speech')}
+                        Speech source
+                        <select
+                          value={aiVoiceMode}
+                          onChange={(event) => setAIVoiceMode(event.target.value as 'tts' | 'fallback')}
                         >
-                          Test audio
-                        </button>
-                        {renderAIServiceStatus('speech')}
-                      </div>
-                      <button
-                        type="button"
-                        disabled={!aiVoiceReady}
-                        onClick={() => void aiVoiceAudioRef.current?.play().catch(() => {
-                          setAIVoiceStatus('The generated voice could not be played by this browser.');
-                        })}
-                      >
-                        Play latest voice preview
-                      </button>
-                      <audio ref={aiVoiceAudioRef} onError={() => {
-                        if (aiVoiceReady) setAIVoiceStatus('The generated voice audio could not be played.');
-                      }} />
+                          <option value="tts">AI TTS provider (default)</option>
+                          <option value="fallback">Local fallback · browser or Kokoro</option>
+                        </select>
+                      </label>
+                      {aiVoiceMode === 'fallback' ? (
+                        <>
+                          <label>
+                            Local fallback engine
+                            <select
+                              value={fallbackVoiceEngine}
+                              onChange={(event) => setFallbackVoiceEngine(
+                                event.target.value as 'browser' | 'kokoro'
+                              )}
+                            >
+                              <option value="browser">Browser voices</option>
+                              <option value="kokoro">Kokoro-82M · local model</option>
+                            </select>
+                          </label>
+                          <p className="freezone-hint">
+                            Local fallback does not call a TTS API. Browser voices start quickly; Kokoro must generate audio on this device first.
+                          </p>
+                          {fallbackVoiceEngine === 'kokoro' ? (
+                            <>
+                              <label>
+                                Kokoro fallback voice
+                                <select
+                                  value={fallbackKokoroVoice}
+                                  onChange={(event) => setFallbackKokoroVoice(event.target.value)}
+                                >
+                                  {FREEZONE_KOKORO_VOICES
+                                    .filter(({ id }) => FREEZONE_KOKORO_BROWSER_VOICE_IDS.has(id))
+                                    .map(({ id, label }) => (
+                                      <option value={id} key={id}>{label}</option>
+                                    ))}
+                                </select>
+                              </label>
+                              <p className="freezone-hint">
+                                The browser model currently supports English voices. It downloads the open model on first use; later requests are local. Use the Kokoro server provider for Portuguese and Spanish.
+                              </p>
+                              <button type="button" onClick={() => void previewAIVoiceFallback()}>
+                                Test Kokoro voice
+                              </button>
+                              <audio ref={aiVoiceAudioRef} onError={() => {
+                                if (aiVoiceReady) setAIVoiceStatus('Kokoro audio could not be played.');
+                              }} />
+                            </>
+                          ) : !('speechSynthesis' in window) ? (
+                            <p className="freezone-hint">Browser speech is not supported on this device.</p>
+                          ) : (
+                            <>
+                              <label>
+                                Fallback browser voice
+                                <select
+                                  value={selectedVoiceURI}
+                                  onChange={(event) => setSelectedVoiceURI(event.target.value)}
+                                >
+                                  <option value="">Browser default voice</option>
+                                  {selectedVoiceURI && !resolveFreezoneVoice(voices, selectedVoiceURI) && (
+                                    <option value={selectedVoiceURI} disabled>Selected voice unavailable</option>
+                                  )}
+                                  {voices.map((voice) => (
+                                    <option key={voice.voiceURI} value={voice.voiceURI}>
+                                      {voice.name} · {voice.lang}
+                                    </option>
+                                  ))}
+                                </select>
+                              </label>
+                              {!voices.length && (
+                                <p className="freezone-hint">No browser voices are available yet.</p>
+                              )}
+                              <button
+                                type="button"
+                                disabled={!voices.length}
+                                onClick={previewAIVoiceFallback}
+                              >
+                                Test fallback voice
+                              </button>
+                            </>
+                          )}
+                        </>
+                      ) : (
+                        <>
+                          <label>
+                            TTS provider
+                            <select
+                              value={aiSettings.voiceProvider}
+                              onChange={(event) => updateAISpeechProvider(event.target.value as FreezoneSpeechProvider)}
+                            >
+                              <option value="gemini-live">Gemini Live</option>
+                              <option value="gemini-tts">Gemini TTS</option>
+                              <option value="openai-tts">OpenAI TTS</option>
+                              <option value="google-tts">Google Cloud TTS</option>
+                              <option value="qwen3-tts">Qwen3-TTS Flash</option>
+                              <option value="kokoro">Kokoro-82M · self-hosted</option>
+                            </select>
+                          </label>
+                          {aiSettings.voiceProvider === 'kokoro' ? (
+                            <>
+                              <label>
+                                Default Kokoro voice
+                                <select
+                                  value={aiSettings.kokoroVoice}
+                                  onChange={(event) => updateAISettings({ kokoroVoice: event.target.value })}
+                                >
+                                  {FREEZONE_KOKORO_VOICES.map(({ id, label }) => (
+                                    <option value={id} key={id}>{label}</option>
+                                  ))}
+                                </select>
+                              </label>
+                              <p className="freezone-hint">
+                                Kokoro is open-source. AI-generated lines use your Kokoro server; browser fallback is local and currently English-only. Configure KOKORO_TTS_URL and KOKORO_API_KEY in Supabase for AI TTS.
+                              </p>
+                            </>
+                          ) : aiSettings.voiceProvider !== 'google-tts' &&
+                            aiSettings.voiceProvider !== 'kokoro' && (
+                            <label>
+                              Voice model ID
+                              <input
+                                value={aiSettings.voiceModel}
+                                maxLength={128}
+                                onChange={(event) => updateAISettings({ voiceModel: event.target.value })}
+                                placeholder={FREEZONE_SPEECH_MODEL_DEFAULTS[aiSettings.voiceProvider as FreezoneSpeechProvider]}
+                              />
+                            </label>
+                          )}
+                          {aiSettings.voiceProvider === 'qwen3-tts' && (
+                            <>
+                              <label>
+                                Default Qwen voice
+                                <select
+                                  value={aiSettings.qwenVoice}
+                                  onChange={(event) => updateAISettings({ qwenVoice: event.target.value })}
+                                >
+                                  <option value="">Use each piece&apos;s voice</option>
+                                  {FREEZONE_QWEN_VOICES.map(({ id, label }) => (
+                                    <option value={id} key={id}>{label}</option>
+                                  ))}
+                                </select>
+                              </label>
+                              <label>
+                                Qwen speech language
+                                <select
+                                  value={aiSettings.qwenLanguage}
+                                  onChange={(event) => updateAISettings({ qwenLanguage: event.target.value })}
+                                >
+                                  <option value="piece">Use each piece&apos;s language</option>
+                                  {FREEZONE_AI_LANGUAGES.map(({ id, label }) => (
+                                    <option value={id} key={id}>{label}</option>
+                                  ))}
+                                </select>
+                              </label>
+                              <p className="freezone-hint">
+                                Per-piece voice and language settings remain available in the designer and unit editor. A default selected here is used when a piece has no Qwen voice override; a language selected here overrides the piece language.
+                              </p>
+                            </>
+                          )}
+                          <label>
+                            Voice API key (optional)
+                            <input
+                              type="password"
+                              autoComplete="new-password"
+                              maxLength={512}
+                              value={aiSettings.serviceApiKeys.speech}
+                              onChange={(event) => updateAIServiceKey('speech', event.target.value)}
+                              placeholder="Vazio usa a chave configurada no servidor"
+                            />
+                          </label>
+                          <div className="freezone-ai-test-row">
+                            <button
+                              type="button"
+                              disabled={aiServiceStatuses.speech?.state === 'checking'}
+                              onClick={() => void testAIService('speech')}
+                            >
+                              {aiSettings.voiceProvider === 'kokoro' ? 'Test Kokoro server' : 'Test audio'}
+                            </button>
+                            {renderAIServiceStatus('speech')}
+                          </div>
+                          <button
+                            type="button"
+                            disabled={!aiVoiceReady}
+                            onClick={() => void aiVoiceAudioRef.current?.play().catch(() => {
+                              setAIVoiceStatus('The generated voice could not be played by this browser.');
+                            })}
+                          >
+                            Play latest voice preview
+                          </button>
+                          <audio ref={aiVoiceAudioRef} onError={() => {
+                            if (aiVoiceReady) setAIVoiceStatus('The generated voice audio could not be played.');
+                          }} />
+                        </>
+                      )}
                       {aiVoiceStatus && <p className="freezone-hint" aria-live="polite">{aiVoiceStatus}</p>}
                     </article>
                   </div>
@@ -2905,6 +4093,468 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
               </form>
             </>
           )}
+          {hud && upgradeModalStage && (
+            <div
+              className="freezone-upgrade-modal-backdrop"
+              onClick={() => setUpgradeModalStage(null)}
+            >
+              <section
+                className="freezone-upgrade-modal"
+                role="dialog"
+                aria-modal="true"
+                aria-labelledby="freezone-upgrade-title"
+                onClick={(event) => event.stopPropagation()}
+              >
+                <header className="freezone-upgrade-modal-header">
+                  <div>
+                    <p className="freezone-eyebrow">FREEZONE PROGRESSION</p>
+                    <h3 id="freezone-upgrade-title">
+                      {upgradeModalStage === 'upgrades' ? 'Upgrade your army'
+                        : upgradeModalStage === 'acquire-choice' ? 'Acquire an army unit'
+                          : upgradeModalStage === 'army-unlocked' ? 'Your new army'
+                            : upgradeModalStage === 'controlled-piece' ? 'Create your piece'
+                              : upgradeModalStage === 'army-replacement' ? 'Replace a piece'
+                                : upgradeModalStage === 'army-celebration' ? 'New army unlocked!'
+                                  : upgradeModalStage === 'allied-bot' ? 'Recruit an allied bot'
+                                    : upgradeModalStage === 'mobility' ? 'Choose a mobility upgrade'
+                                      : 'Expand movement area'}
+                    </h3>
+                  </div>
+                  <div className="freezone-upgrade-modal-actions">
+                    <span className="freezone-upgrade-xp" aria-label={`${hud.xp} XP available`}>
+                      <i aria-hidden="true">✦</i> {hud.xp} XP
+                    </span>
+                    <button
+                      type="button"
+                      className="freezone-upgrade-modal-close"
+                      onClick={() => setUpgradeModalStage(null)}
+                      aria-label="Close upgrades"
+                    >
+                      ×
+                    </button>
+                  </div>
+                </header>
+
+                {upgradeModalStage === 'upgrades' && (
+                  <>
+                    <p className="freezone-upgrade-modal-intro">
+                      Light spheres are ready to buy. Gold-rimmed spheres are already active.
+                      Choose a sphere to spend an orb, or use its XP option to keep your orb balance.
+                    </p>
+                    <div className="freezone-sphere-legend" aria-label="Sphere status legend">
+                      <span><i className="owned" /> Active</span>
+                      <span><i className="available" /> Available</span>
+                      <span><i className="locked" /> Locked</span>
+                    </div>
+                    <div className="freezone-sphere-list">
+                      <FreezoneUpgradeSphereRow
+                        label="Move actions per cycle"
+                        detail={`${hud.movesPerCycle} actions · Red ${hud.orbBalances.red}`}
+                        color="red"
+                        level={hud.upgradeLevels.red}
+                        maxLevel={hud.upgradeLevelLimits.red}
+                        canActivate={hud.isPlayer && hud.canUpgrade.red &&
+                          (hud.orbBalances.red >= 1 || hud.xp >= (upgradeXpCosts?.red ?? 0))}
+                        onActivate={() => void purchaseUpgrade('red', defaultUpgradePayment('red'))}
+                        xpCost={upgradeXpCosts?.red ?? 0}
+                        canBuyWithXp={hud.isPlayer && hud.canUpgrade.red &&
+                          hud.xp >= (upgradeXpCosts?.red ?? 0)}
+                        onBuyWithXp={() => void purchaseUpgrade('red', 'xp')}
+                      />
+                      <FreezoneUpgradeSphereRow
+                        label="Movement steps per cycle"
+                        detail={`${hud.stepBudget} steps · Blue ${hud.orbBalances.blue}`}
+                        color="blue"
+                        level={hud.upgradeLevels.blue}
+                        maxLevel={hud.upgradeLevelLimits.blue}
+                        canActivate={hud.isPlayer && hud.canUpgrade.blue &&
+                          (hud.orbBalances.blue >= 1 || hud.xp >= (upgradeXpCosts?.blue ?? 0))}
+                        onActivate={() => void purchaseUpgrade('blue', defaultUpgradePayment('blue'))}
+                        xpCost={upgradeXpCosts?.blue ?? 0}
+                        canBuyWithXp={hud.isPlayer && hud.canUpgrade.blue &&
+                          hud.xp >= (upgradeXpCosts?.blue ?? 0)}
+                        onBuyWithXp={() => void purchaseUpgrade('blue', 'xp')}
+                      />
+                      <FreezoneUpgradeSphereRow
+                        label="Cooldown"
+                        detail={`${(hud.cooldownDurationMs / 1000).toFixed(1)} sec · Yellow ${hud.orbBalances.yellow}`}
+                        color="yellow"
+                        level={hud.upgradeLevels.yellow}
+                        maxLevel={hud.upgradeLevelLimits.yellow}
+                        canActivate={hud.isPlayer && hud.canUpgrade.yellow &&
+                          (hud.orbBalances.yellow >= 1 || hud.xp >= (upgradeXpCosts?.yellow ?? 0))}
+                        onActivate={() => void purchaseUpgrade('yellow', defaultUpgradePayment('yellow'))}
+                        xpCost={upgradeXpCosts?.yellow ?? 0}
+                        canBuyWithXp={hud.isPlayer && hud.canUpgrade.yellow &&
+                          hud.xp >= (upgradeXpCosts?.yellow ?? 0)}
+                        onBuyWithXp={() => void purchaseUpgrade('yellow', 'xp')}
+                      />
+                      <FreezoneUpgradeSphereRow
+                        label="Army capacity"
+                        detail={`${hud.capacity}/${hud.maxCapacity} slots · Purple ${hud.orbBalances.purple}`}
+                        color="purple"
+                        level={hud.upgradeLevels.purple}
+                        maxLevel={hud.upgradeLevelLimits.purple}
+                        canActivate={hud.isPlayer && hud.canUpgrade.purple &&
+                          (hud.orbBalances.purple >= 1 || hud.xp >= (upgradeXpCosts?.purple ?? 0))}
+                        onActivate={() => void purchaseUpgrade('purple', defaultUpgradePayment('purple'))}
+                        xpCost={upgradeXpCosts?.purple ?? 0}
+                        canBuyWithXp={hud.isPlayer && hud.canUpgrade.purple &&
+                          hud.xp >= (upgradeXpCosts?.purple ?? 0)}
+                        onBuyWithXp={() => void purchaseUpgrade('purple', 'xp')}
+                      />
+                      <FreezoneUpgradeSphereRow
+                        label="Acquire an army unit"
+                        detail={`${hud.pieces}/${hud.capacity} controllable pieces · ${hud.xpCost} XP per piece`}
+                        color="teal"
+                        level={Math.min(hud.pieces, hud.capacity)}
+                        maxLevel={hud.capacity}
+                        canActivate={canAcquireArmyUnit}
+                        onActivate={() => setUpgradeModalStage('acquire-choice')}
+                      />
+                      <FreezoneUpgradeSphereRow
+                        label="Movement geometry"
+                        detail={`${hud.envelopeRows}×${hud.envelopeCols} area · White ${hud.orbBalances.white} · Movement ${hud.orbBalances.movement}`}
+                        color="white"
+                        level={Math.min(hud.upgradeLevels.white, hud.upgradeLevelLimits.white)}
+                        maxLevel={Math.max(1, hud.upgradeLevelLimits.white)}
+                        canActivate={hud.isPlayer &&
+                          (canBuyEnvelopeWithCurrentResources || canBuyMovementOffsetWithCurrentResources)}
+                        onActivate={() => setUpgradeModalStage('mobility')}
+                      />
+                    </div>
+                    <p className="freezone-upgrade-modal-footnote">
+                      XP prices match the current price of the corresponding orb. Buying with an orb uses your stored balance.
+                    </p>
+                  </>
+                )}
+
+                {upgradeModalStage === 'acquire-choice' && (
+                  <div className="freezone-acquisition-choices">
+                    <p className="freezone-upgrade-modal-intro">
+                      Choose how this unit joins your team. Controllable pieces use army capacity; allied bots use XP and act independently.
+                    </p>
+                    <button
+                      type="button"
+                      className="freezone-acquisition-card"
+                      disabled={!hud.isPlayer || hud.xp < hud.xpCost || !hud.pieceOptions.length}
+                      onClick={() => setUpgradeModalStage('army-unlocked')}
+                    >
+                      <span className="freezone-acquisition-icon controlled" aria-hidden="true">♞</span>
+                      <span>
+                        <strong>Controllable piece</strong>
+                        <small>Create a piece for your army, then choose its movement.</small>
+                      </span>
+                      <b>{hud.xpCost} XP</b>
+                    </button>
+                    <button
+                      type="button"
+                      className="freezone-acquisition-card"
+                      disabled={!hud.isPlayer || !hud.teamPieces.length || hud.xp < hud.allyCost}
+                      onClick={() => setUpgradeModalStage('allied-bot')}
+                    >
+                      <span className="freezone-acquisition-icon bot" aria-hidden="true">✦</span>
+                      <span>
+                        <strong>Allied bot</strong>
+                        <small>Choose its name and role. It moves independently and does not use a regular army slot.</small>
+                      </span>
+                      <b>{hud.allyCost} XP</b>
+                    </button>
+                    {hud.pieces >= hud.capacity && (
+                      <p className="freezone-hint">
+                        Your controllable army is full. You can replace a non-king piece when you acquire another.
+                      </p>
+                    )}
+                    <button type="button" className="freezone-modal-back" onClick={() => setUpgradeModalStage('upgrades')}>
+                      Back to upgrades
+                    </button>
+                  </div>
+                )}
+
+                {upgradeModalStage === 'army-unlocked' && (
+                  <section className="freezone-army-unlocked">
+                    <span className="freezone-army-unlocked-icon" aria-hidden="true">♞</span>
+                    <p className="freezone-eyebrow">A NEW CHAPTER BEGINS</p>
+                    <h4>Congratulations! Your new army is unlocked.</h4>
+                    <p>Create a piece with its own name, role, appearance, and victory phrase.</p>
+                    <button
+                      type="button"
+                      className="freezone-design-acquire"
+                      onClick={() => setUpgradeModalStage('controlled-piece')}
+                    >
+                      Create your new army
+                    </button>
+                    <button
+                      type="button"
+                      className="freezone-modal-back"
+                      onClick={() => setUpgradeModalStage('acquire-choice')}
+                    >
+                      Back
+                    </button>
+                  </section>
+                )}
+
+                {upgradeModalStage === 'controlled-piece' && (
+                  <div className="freezone-controlled-piece-form">
+                    <p className="freezone-upgrade-modal-intro">
+                      Set up your piece, then create it when you are ready.
+                    </p>
+                    <div className="freezone-controlled-piece-fields">
+                      <label>
+                        Name
+                        <input
+                          value={pieceName}
+                          maxLength={32}
+                          placeholder={selectedAcquisitionPattern?.name || 'Name your piece'}
+                          onChange={(event) => setPieceName(event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        Role / title
+                        <input
+                          value={pieceTitle}
+                          maxLength={32}
+                          placeholder="General"
+                          onChange={(event) => setPieceTitle(event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        Appearance
+                        <select value={appearance} onChange={(event) => setAppearance(event.target.value)}>
+                          {FREEZONE_APPEARANCES.map((option) => (
+                            <option value={option.id} key={option.id}>{option.label}</option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Victory phrase
+                        <input
+                          value={pieceCatchphrase}
+                          maxLength={120}
+                          placeholder={selectedAcquisitionPattern?.catchphrase || 'Victory is ours!'}
+                          onChange={(event) => setPieceCatchphrase(event.target.value)}
+                        />
+                      </label>
+                    </div>
+                    {open && (
+                      <FreezoneAppearancePreview
+                        appearance={appearance}
+                        label={FREEZONE_APPEARANCES.find((option) => option.id === appearance)?.label || appearance}
+                      />
+                    )}
+                    <div className="freezone-controlled-piece-actions">
+                      <button
+                        type="button"
+                        className="freezone-design-acquire"
+                        disabled={!hud.isPlayer || purchaseBusy || !selectedAcquisitionPattern ||
+                          hud.xp < hud.xpCost}
+                        onClick={acquireSelectedPattern}
+                      >
+                        Create piece · {hud.xpCost} XP
+                      </button>
+                      <button
+                        type="button"
+                        className="freezone-modal-back"
+                        onClick={() => setUpgradeModalStage('army-unlocked')}
+                      >
+                        Back
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {upgradeModalStage === 'army-replacement' && pendingReplacement && (
+                  <div className="freezone-replacement">
+                    <p>
+                      Your army is full. Choose a non-king piece to replace with {pendingReplacement.name}.
+                      This costs {hud.xpCost} XP.
+                    </p>
+                    {hud.ownedPieces.map((piece) => (
+                      <button
+                        type="button"
+                        key={piece.id}
+                        disabled={purchaseBusy || piece.type === 'king'}
+                        onClick={() => void acquirePiece(pendingReplacement, piece.id)}
+                      >
+                        Replace {piece.name}{piece.type === 'king' ? ' · King cannot be replaced' : ''}
+                      </button>
+                    ))}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setPendingReplacement(null);
+                        setStatus('');
+                        setUpgradeModalStage('controlled-piece');
+                      }}
+                    >
+                      Back to piece details
+                    </button>
+                  </div>
+                )}
+
+                {upgradeModalStage === 'army-celebration' && (
+                  <section className="freezone-army-celebration">
+                    <div className="freezone-army-confetti" aria-hidden="true">
+                      {Array.from({ length: 24 }, (_, index) => (
+                        <i
+                          key={index}
+                          style={{
+                            left: `${(index * 37) % 100}%`,
+                            animationDelay: `${(index % 8) * 0.1}s`
+                          }}
+                        />
+                      ))}
+                    </div>
+                    <span className="freezone-army-celebration-icon" aria-hidden="true">♞</span>
+                    <p className="freezone-eyebrow">A NEW ALLY JOINS THE ARENA</p>
+                    <h4>Congratulations! Your new army is ready.</h4>
+                    <p>
+                      <strong>{armyCelebrationName}</strong> has joined your team. Your new piece is ready to move.
+                    </p>
+                    <button
+                      type="button"
+                      className="freezone-design-acquire"
+                      onClick={() => setUpgradeModalStage(null)}
+                    >
+                      Return to the game
+                    </button>
+                  </section>
+                )}
+
+                {upgradeModalStage === 'allied-bot' && (
+                  <div className="freezone-allied-bot-form">
+                    <p className="freezone-upgrade-modal-intro">
+                      Allied bots have their own pieces and do not take a regular army slot.
+                    </p>
+                    <label>
+                      Bot name (optional)
+                      <input
+                        value={allyNameDraft}
+                        maxLength={32}
+                        placeholder="Default role name"
+                        onChange={(event) => setAllyNameDraft(event.target.value)}
+                      />
+                    </label>
+                    <label>
+                      Bot role
+                      <select
+                        value={allyRole}
+                        onChange={(event) => setAllyRole(event.target.value as FreezoneAllyRole)}
+                        disabled={!hud.isPlayer || purchaseBusy}
+                      >
+                        {Object.entries(FREEZONE_ALLY_LABELS).map(([role, label]) => (
+                          <option key={role} value={role}>{label}</option>
+                        ))}
+                      </select>
+                    </label>
+                    <p>{FREEZONE_ALLY_DESCRIPTIONS[allyRole]}</p>
+                    <div className="freezone-controlled-piece-actions">
+                      <button
+                        type="button"
+                        className="freezone-design-acquire"
+                        disabled={!hud.isPlayer || purchaseBusy || !hud.teamPieces.length ||
+                          hud.xp < hud.allyCost}
+                        onClick={() => void recruitAlly()}
+                      >
+                        Recruit bot · {hud.allyCost} XP
+                      </button>
+                      <button type="button" className="freezone-modal-back" onClick={() => setUpgradeModalStage('acquire-choice')}>
+                        Back
+                      </button>
+                    </div>
+                  </div>
+                )}
+
+                {upgradeModalStage === 'mobility' && (
+                  <div className="freezone-mobility-choices">
+                    <p className="freezone-upgrade-modal-intro">
+                      Expand the area a piece can use, or add a specific movement offset.
+                    </p>
+                    <button
+                      type="button"
+                      className="freezone-acquisition-card"
+                      disabled={!hud.isPlayer || !upgradeableEnvelopes.length}
+                      onClick={() => setUpgradeModalStage('envelope')}
+                    >
+                      <span className="freezone-acquisition-icon geometry" aria-hidden="true">▦</span>
+                      <span>
+                        <strong>Increase movement area</strong>
+                        <small>Choose a larger rows × columns envelope for configurable movement.</small>
+                      </span>
+                      <b>{FREEZONE_ENVELOPE_ORB_COST} white orbs / level</b>
+                    </button>
+                    <button
+                      type="button"
+                      className="freezone-acquisition-card"
+                      disabled={!hud.isPlayer || !hud.ownedPieces.length ||
+                        (hud.orbBalances.movement < FREEZONE_MOVEMENT_ORB_COST && hud.xp < movementOrbXpCost)}
+                      onClick={openMovementOffsetControls}
+                    >
+                      <span className="freezone-acquisition-icon offset" aria-hidden="true">↗</span>
+                      <span>
+                        <strong>Unlock or change an offset</strong>
+                        <small>Select a piece and choose drag, jump, or teleport for a movement card.</small>
+                      </span>
+                      <b>{FREEZONE_MOVEMENT_ORB_COST} movement orb / offset</b>
+                    </button>
+                    <button type="button" className="freezone-modal-back" onClick={() => setUpgradeModalStage('upgrades')}>
+                      Back to upgrades
+                    </button>
+                  </div>
+                )}
+
+                {upgradeModalStage === 'envelope' && (
+                  <div className="freezone-envelope-form">
+                    <p className="freezone-upgrade-modal-intro">
+                      Current area: {hud.envelopeRows}×{hud.envelopeCols}. Larger areas unlock more movement offsets.
+                    </p>
+                    <label>
+                      New movement area
+                      <select
+                        value={`${effectiveTargetEnvelope.rows}x${effectiveTargetEnvelope.cols}`}
+                        onChange={(event) => {
+                          const [rows, cols] = event.target.value.split('x').map(Number);
+                          setTargetEnvelope({ rows, cols });
+                        }}
+                        disabled={!upgradeableEnvelopes.length || purchaseBusy}
+                      >
+                        {upgradeableEnvelopes.map((option) => (
+                          <option key={`${option.rows}x${option.cols}`} value={`${option.rows}x${option.cols}`}>
+                            {option.rows}×{option.cols}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                    <div className="freezone-controlled-piece-actions">
+                      <button
+                        type="button"
+                        disabled={!hud.isPlayer || purchaseBusy || !upgradeableEnvelopes.length ||
+                          hud.orbBalances.white < targetEnvelopeCost}
+                        onClick={() => void purchaseEnvelopeUpgrade('orb')}
+                      >
+                        Spend {targetEnvelopeCost} white orb{targetEnvelopeCost === 1 ? '' : 's'}
+                      </button>
+                      <button
+                        type="button"
+                        className="freezone-design-acquire"
+                        disabled={!hud.isPlayer || purchaseBusy || !upgradeableEnvelopes.length ||
+                          hud.xp < whiteOrbXpCost}
+                        onClick={() => void purchaseEnvelopeUpgrade('xp')}
+                      >
+                        Buy with XP · {whiteOrbXpCost} XP
+                      </button>
+                      <button type="button" className="freezone-modal-back" onClick={() => setUpgradeModalStage('mobility')}>
+                        Back
+                      </button>
+                    </div>
+                    {!upgradeableEnvelopes.length && <p className="freezone-hint">Movement area is already at its maximum.</p>}
+                  </div>
+                )}
+
+                {status && <p className="freezone-upgrade-modal-status" role="status">{status}</p>}
+              </section>
+            </div>
+          )}
           <p className="freezone-status" aria-live="polite">{status}</p>
         </section>
       </div>
@@ -2917,12 +4567,19 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
       {inspectedPiece && (
         <div
           className="freezone-piece-card"
-          role="status"
+          role="dialog"
+          aria-label={`${inspectedPiece.name} profile`}
           style={{
             left: Math.max(8, Math.min(inspectedPiece.x + 14, window.innerWidth - 280)),
             top: Math.max(8, Math.min(inspectedPiece.y + 14, window.innerHeight - 300))
           }}
         >
+          <button
+            type="button"
+            className="freezone-piece-card-close"
+            aria-label="Close piece profile"
+            onClick={() => setInspectedPiece(null)}
+          >×</button>
           <strong>{inspectedPiece.name}</strong>
           <span>{inspectedPiece.title || 'Piece'} · {inspectedPiece.type} · {FREEZONE_APPEARANCES.find(({ id }) => id === inspectedPiece.appearance)?.label || 'Classic'}</span>
           <span>
@@ -2935,6 +4592,70 @@ export default function FreezonePanel({ mainMenuOpen }: FreezonePanelProps) {
           {inspectedPiece.catchphrase && <q>{inspectedPiece.catchphrase}</q>}
           <span>Eliminations: {inspectedPiece.eliminations}</span>
           <span>{inspectedPiece.slide ? 'Sliding pattern' : 'Step pattern'}</span>
+          {hud?.isPlayer && inspectedSide !== undefined &&
+            inspectedSide !== hud.playerSide && (
+              <section className="freezone-piece-relations" aria-label="Team relations">
+                <strong>
+                  Team relation: {inspectedRelation?.status === 'ally'
+                    ? 'Allied'
+                    : inspectedRelation?.status === 'enemy' ? 'Mortal enemy' : 'Neutral'}
+                </strong>
+                {incomingAlliance && (
+                  <div className="freezone-piece-relation-actions">
+                    <button
+                      type="button"
+                      disabled={relationBusy}
+                      onClick={() => void changeTeamRelation(
+                        inspectedSide,
+                        'accept',
+                        incomingAlliance.id
+                      )}
+                    >Accept alliance</button>
+                    <button
+                      type="button"
+                      disabled={relationBusy}
+                      onClick={() => void changeTeamRelation(
+                        inspectedSide,
+                        'decline',
+                        incomingAlliance.id
+                      )}
+                    >Decline</button>
+                  </div>
+                )}
+                {outgoingAlliance && <span>Alliance invitation pending.</span>}
+                {inspectedRelation?.status === 'ally' && (
+                  <button
+                    type="button"
+                    disabled={relationBusy}
+                    onClick={() => void changeTeamRelation(inspectedSide, 'neutral')}
+                  >End alliance</button>
+                )}
+                {inspectedRelation?.status !== 'enemy' && (
+                  <button
+                    type="button"
+                    disabled={relationBusy}
+                    onClick={() => void changeTeamRelation(inspectedSide, 'enemy')}
+                  >Declare mortal enemy</button>
+                )}
+                {inspectedRelation?.status === 'enemy' && (
+                  <button
+                    type="button"
+                    disabled={relationBusy}
+                    onClick={() => void changeTeamRelation(inspectedSide, 'neutral')}
+                  >Return to neutral</button>
+                )}
+                {inspectedRelation?.status !== 'ally' &&
+                  !incomingAlliance && !outgoingAlliance && (
+                    inspectedPlayer?.bot
+                      ? <span>AI teams cannot approve player invitations.</span>
+                      : <button
+                        type="button"
+                        disabled={relationBusy || !inspectedPlayer}
+                        onClick={() => void changeTeamRelation(inspectedSide, 'invite')}
+                      >Invite to alliance</button>
+                  )}
+              </section>
+            )}
           <FreezoneMovementDiagram piece={inspectedPiece} />
         </div>
       )}

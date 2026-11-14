@@ -28,44 +28,55 @@ function requireClient() {
   return supabase;
 }
 
-async function invokeFreezoneFunction(name, payload, audio = false) {
+async function invokeFreezoneFunction(name, payload, audio = false, timeoutMs = 0, signal) {
   requireClient();
-  const response = await fetch(`${supabaseUrl.replace(/\/+$/, '')}/functions/v1/${name}`, {
-    method: 'POST',
-    headers: {
-      apikey: supabaseKey,
-      Authorization: `Bearer ${supabaseKey}`,
-      'Content-Type': 'application/json'
-    },
-    body: JSON.stringify(payload)
-  });
-  if (!response.ok) {
-    let message = `Freezone ${name} failed (${response.status}).`;
-    try {
-      const body = await response.text();
-      try {
-        const parsed = JSON.parse(body);
-        if (typeof parsed.error === 'string') message = parsed.error;
-      } catch {
-        if (body) message = body.slice(0, 240);
-      }
-    } catch {
-      message = `Freezone ${name} failed (${response.status}).`;
-    }
-    throw new Error(message);
-  }
-  if (audio) {
-    const blob = await response.blob();
-    if (!blob.size || blob.size > 5 * 1024 * 1024 ||
-        !blob.type.toLowerCase().startsWith('audio/')) {
-      throw new Error('Freezone voice returned empty, non-audio, or oversized content.');
-    }
-    return blob;
-  }
+  const controller = timeoutMs > 0 ? new AbortController() : null;
+  const timeoutId = controller
+    ? setTimeout(() => controller.abort(), timeoutMs)
+    : null;
   try {
-    return await response.json();
-  } catch {
-    throw new Error('Freezone AI returned an unreadable response.');
+    const response = await fetch(`${supabaseUrl.replace(/\/+$/, '')}/functions/v1/${name}`, {
+      method: 'POST',
+      headers: {
+        apikey: supabaseKey,
+        Authorization: `Bearer ${supabaseKey}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify(payload),
+      ...(controller ? { signal: controller.signal } : signal ? { signal } : {})
+    });
+    if (!response.ok) {
+      let message = `Freezone ${name} failed (${response.status}).`;
+      try {
+        const body = await response.text();
+        try {
+          const parsed = JSON.parse(body);
+          if (typeof parsed.error === 'string') message = parsed.error;
+        } catch {
+          if (body) message = body.slice(0, 240);
+        }
+      } catch {
+        message = `Freezone ${name} failed (${response.status}).`;
+      }
+      const error = new Error(message);
+      error.status = response.status;
+      throw error;
+    }
+    if (audio) {
+      const blob = await response.blob();
+      if (!blob.size || blob.size > 5 * 1024 * 1024 ||
+          !blob.type.toLowerCase().startsWith('audio/')) {
+        throw new Error('Freezone voice returned empty, non-audio, or oversized content.');
+      }
+      return blob;
+    }
+    try {
+      return await response.json();
+    } catch {
+      throw new Error('Freezone AI returned an unreadable response.');
+    }
+  } finally {
+    if (timeoutId !== null) clearTimeout(timeoutId);
   }
 }
 
@@ -80,17 +91,20 @@ export function requestFreezoneAIMove(payload) {
     dialogueProvider: settings.dialogueProvider,
     dialogueModel: settings.dialogueModel,
     dialogueApiKey: settings.dialogueApiKey
-  });
+  }, false, 36_000);
 }
 
-export function requestFreezoneSpeech(payload) {
+export function requestFreezoneSpeech(payload, signal) {
   const settings = getFreezoneAIRequestSettings();
   return invokeFreezoneFunction('freezone-speech', {
     ...payload,
     provider: settings.voiceProvider,
     model: settings.voiceModel,
-    apiKey: settings.voiceApiKey
-  }, true);
+    apiKey: settings.voiceApiKey,
+    qwenVoice: settings.qwenVoice,
+    qwenLanguage: settings.qwenLanguage,
+    kokoroVoice: payload.kokoroVoice || settings.kokoroVoice
+  }, true, 0, signal);
 }
 
 export function testFreezoneAIService(payload) {
@@ -101,10 +115,16 @@ export function testFreezoneAIService(payload) {
 }
 
 export function testFreezoneSpeechService(payload) {
+  const kokoroVoice = payload.kokoroVoice || 'af_heart';
+  const text = payload.text || (payload.provider === 'kokoro'
+    ? kokoroVoice.startsWith('p') ? 'A voz do Kokoro está funcionando.'
+      : kokoroVoice.startsWith('e') ? 'La voz de Kokoro está funcionando.'
+        : 'The Kokoro voice is working.'
+    : 'A voz do Freezone está funcionando.');
   return invokeFreezoneFunction('freezone-speech', {
     ...payload,
     action: 'test',
-    text: 'A voz do Freezone está funcionando.'
+    text
   }, true);
 }
 
