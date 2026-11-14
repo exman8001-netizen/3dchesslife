@@ -128,7 +128,9 @@ const gameplayMusicPlaylist = localMusicTracks.map(([, url]) => url);
 export default function App() {
   const initializedRef = useRef(false);
   const backgroundMusicRef = useRef<HTMLAudioElement>(null);
+  const musicPausedByUserRef = useRef(false);
   const [mainMenuOpen, setMainMenuOpen] = useState(true);
+  const [backgroundMusicPlaying, setBackgroundMusicPlaying] = useState(false);
   const [displaySettingsLoad] = useState(loadDisplayPreferences);
   const [displayPreferences, setDisplayPreferences] = useState<DisplayPreferences>(
     displaySettingsLoad.preferences
@@ -167,10 +169,13 @@ export default function App() {
       audio.pause();
       audio.removeAttribute('src');
       audio.load();
+      setBackgroundMusicPlaying(false);
       return undefined;
     }
 
     let trackIndex = 0;
+    musicPausedByUserRef.current = false;
+    const updatePlaybackState = () => setBackgroundMusicPlaying(!audio.paused);
     const playCurrentTrack = () => {
       audio.volume = 0.32;
       void audio.play().catch((error: unknown) => {
@@ -187,7 +192,7 @@ export default function App() {
       playCurrentTrack();
     };
     const resumeAfterInteraction = () => {
-      if (audio.paused) playCurrentTrack();
+      if (audio.paused && !musicPausedByUserRef.current) playCurrentTrack();
     };
 
     audio.preload = 'auto';
@@ -195,17 +200,22 @@ export default function App() {
     audio.src = tracks[trackIndex];
     audio.load();
     audio.addEventListener('ended', handleTrackEnded);
+    audio.addEventListener('play', updatePlaybackState);
+    audio.addEventListener('pause', updatePlaybackState);
     document.addEventListener('pointerdown', resumeAfterInteraction);
     document.addEventListener('keydown', resumeAfterInteraction);
     playCurrentTrack();
 
     return () => {
       audio.removeEventListener('ended', handleTrackEnded);
+      audio.removeEventListener('play', updatePlaybackState);
+      audio.removeEventListener('pause', updatePlaybackState);
       document.removeEventListener('pointerdown', resumeAfterInteraction);
       document.removeEventListener('keydown', resumeAfterInteraction);
       audio.pause();
       audio.removeAttribute('src');
       audio.load();
+      setBackgroundMusicPlaying(false);
     };
   }, [mainMenuOpen, freezoneActive]);
 
@@ -394,6 +404,39 @@ export default function App() {
     setDisplayPreferences((current) => ({ ...current, [key]: !current[key] }));
   };
 
+  const toggleBackgroundMusic = () => {
+    const audio = backgroundMusicRef.current;
+    if (!audio) return;
+    if (audio.paused) {
+      musicPausedByUserRef.current = false;
+      void audio.play().catch((error: unknown) => {
+        if (error instanceof DOMException &&
+            (error.name === 'NotAllowedError' || error.name === 'AbortError')) return;
+        console.warn('Could not play background music.', error);
+      });
+    } else {
+      musicPausedByUserRef.current = true;
+      audio.pause();
+    }
+  };
+
+  const renderMusicToggle = (className: string) => (
+    <button
+      type="button"
+      className={className}
+      onClick={toggleBackgroundMusic}
+      aria-label={backgroundMusicPlaying ? 'Pause music' : 'Play music'}
+      aria-pressed={backgroundMusicPlaying}
+      title={backgroundMusicPlaying ? 'Pause music' : 'Play music'}
+    >
+      <svg viewBox="0 0 24 24" aria-hidden="true">
+        {backgroundMusicPlaying
+          ? <path d="M7 5h4v14H7zM14 5h4v14h-4z" />
+          : <path d="M8 5.5v13L18 12 8 5.5Z" />}
+      </svg>
+    </button>
+  );
+
   return (
     <>
       <audio ref={backgroundMusicRef} preload="auto" aria-hidden="true" />
@@ -565,6 +608,8 @@ export default function App() {
           <div className="hud-divider" aria-hidden="true"></div>
           <div className="mobile-sheet-section-label">Display &amp; Gestures</div>
 
+          {!freezoneActive && renderMusicToggle('hud-btn hud-icon-button background-music-toggle')}
+
           <button
             className="hud-btn"
             id="btn-hide-ui"
@@ -596,13 +641,16 @@ export default function App() {
           <p className="main-menu-eyebrow">SANCTUM · CHOOSE YOUR GAME</p>
           <h1 id="main-menu-title">Wizard Chess</h1>
           <p className="main-menu-description">Choose how you want to play.</p>
-          <button
-            type="button"
-            className="display-settings-open"
-            onClick={() => setDisplaySettingsOpen(true)}
-          >
-            ⚙ Display settings
-          </button>
+          <div className="main-menu-utilities">
+            <button
+              type="button"
+              className="display-settings-open"
+              onClick={() => setDisplaySettingsOpen(true)}
+            >
+              ⚙ Display settings
+            </button>
+            {renderMusicToggle('background-music-toggle menu-music-toggle')}
+          </div>
           <div className="main-menu-actions">
             {displayPreferences.menuMultiplayer && (
               <button

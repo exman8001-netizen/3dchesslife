@@ -1002,9 +1002,17 @@ body.cinematic-ui-hidden .freezone-feedback {
   color: var(--muted);
 }
 
+.main-menu-utilities {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  margin: -10px 0 18px;
+}
+
 .display-settings-open {
   min-height: 36px;
-  margin: -10px 0 18px;
+  margin: 0;
   padding: 7px 12px;
   border: 1px solid rgba(212, 175, 55, 0.3);
   border-radius: 999px;
@@ -1013,6 +1021,38 @@ body.cinematic-ui-hidden .freezone-feedback {
   cursor: pointer;
   font: inherit;
   font-size: 0.72rem;
+}
+
+.background-music-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 38px;
+  min-width: 38px;
+  height: 36px;
+  border: 1px solid rgba(212, 175, 55, 0.4);
+  border-radius: 999px;
+  background: rgba(8, 10, 15, 0.68);
+  color: #e5d28e;
+  cursor: pointer;
+  transition: border-color 0.18s ease, color 0.18s ease, background 0.18s ease;
+}
+
+.background-music-toggle:hover {
+  border-color: var(--gold-bright);
+  background: rgba(212, 175, 55, 0.12);
+  color: var(--gold-bright);
+}
+
+.background-music-toggle:focus-visible {
+  outline: 2px solid #8fd9ff;
+  outline-offset: 2px;
+}
+
+.background-music-toggle svg {
+  width: 17px;
+  height: 17px;
+  fill: currentColor;
 }
 
 .display-settings-open:hover,

@@ -657,6 +657,7 @@ test('Main menu applies the glass-and-gold finish to the card without altering t
 
 test('Music folder supplies the intro track and a looping gameplay playlist', () => {
   const app = fs.readFileSync(path.join(ROOT, 'src/App.tsx'), 'utf-8');
+  const styles = fs.readFileSync(path.join(ROOT, 'src/styles.css'), 'utf-8');
   const musicFiles = fs.readdirSync(path.join(ROOT, 'music'));
 
   assert.ok(musicFiles.some((file) => /brass sabers/i.test(file)));
@@ -667,6 +668,14 @@ test('Music folder supplies the intro track and a looping gameplay playlist', ()
   assert.ok(app.includes("error.name === 'NotAllowedError'"));
   assert.ok(app.includes("document.addEventListener('pointerdown', resumeAfterInteraction)"));
   assert.ok(app.includes(': freezoneActive ? [] : gameplayMusicPlaylist'));
+  assert.ok(app.includes('aria-label={backgroundMusicPlaying ? \'Pause music\' : \'Play music\'}'));
+  assert.ok(app.includes('aria-pressed={backgroundMusicPlaying}'));
+  assert.ok(app.includes('musicPausedByUserRef.current = true;'));
+  assert.ok(app.includes('audio.paused && !musicPausedByUserRef.current'));
+  assert.ok(app.includes("renderMusicToggle('background-music-toggle menu-music-toggle')"));
+  assert.ok(app.includes("renderMusicToggle('hud-btn hud-icon-button background-music-toggle')"));
+  assert.ok(styles.includes('.background-music-toggle svg'));
+  assert.ok(styles.includes('.background-music-toggle:focus-visible'));
 });
 
 test('Display settings hide marked controls by default and persist user choices', () => {
